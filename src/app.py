@@ -96,8 +96,13 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Load the trained model
-MODEL_PATH = "plant_disease_model.keras"
+# Ensure MODEL_PATH is an absolute path
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+MODEL_PATH = os.path.join(BASE_DIR, "plant_disease_model.keras")
+print(f"Model path: {MODEL_PATH}")
+print(f"Does the model file exist? {os.path.exists(MODEL_PATH)}")
+if not os.path.exists(MODEL_PATH):
+    raise FileNotFoundError(f"Model file not found at {MODEL_PATH}")
 model = tf.keras.models.load_model(MODEL_PATH)
 
 # Define initial class names for plant diseases
