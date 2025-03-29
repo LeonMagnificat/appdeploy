@@ -98,7 +98,7 @@ app.add_middleware(
 
 # Ensure MODEL_PATH is an absolute path
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-MODEL_PATH = os.path.join(BASE_DIR, "plant_disease_model.h5")
+MODEL_PATH = os.path.join(BASE_DIR, "../models/plant_disease_model.h5")
 print(f"Model path: {MODEL_PATH}")
 print(f"Does the model file exist? {os.path.exists(MODEL_PATH)}")
 if not os.path.exists(MODEL_PATH):
