@@ -384,7 +384,7 @@ async def retrain(files: List[UploadFile] = File(...),
             validation_generator = None
         
         # 4. Create a new model for fine-tuning
-        temp_model_path = os.path.join(os.path.dirname(MODEL_PATH), "temp_model.keras")
+        temp_model_path = os.path.join(os.path.dirname(MODEL_PATH), "temp_model.h5")
         model.save(temp_model_path)
         working_model = tf.keras.models.load_model(temp_model_path)
         
@@ -455,7 +455,7 @@ async def retrain(files: List[UploadFile] = File(...),
         save_visualizations(y_true, y_pred_classes, target_names)
         
         # 9. Save the fine-tuned model
-        fine_tuned_model_path = os.path.join(os.path.dirname(MODEL_PATH), "plant_disease_model.keras")
+        fine_tuned_model_path = os.path.join(os.path.dirname(MODEL_PATH), "plant_disease_model.h5")
         working_model.save(fine_tuned_model_path)
         model = tf.keras.models.load_model(fine_tuned_model_path)
         
@@ -527,7 +527,7 @@ async def retrain(files: List[UploadFile] = File(...),
                 shutil.rmtree(extract_dir)
         if os.path.exists(new_data_dir):
             shutil.rmtree(new_data_dir)
-        temp_model_path = os.path.join(os.path.dirname(MODEL_PATH), "temp_model.keras")
+        temp_model_path = os.path.join(os.path.dirname(MODEL_PATH), "temp_model.h5")
         if os.path.exists(temp_model_path):
             os.remove(temp_model_path)
 
