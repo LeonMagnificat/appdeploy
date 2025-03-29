@@ -97,7 +97,7 @@ app.add_middleware(
 )
 
 # Load the trained model
-MODEL_PATH = "../models/plant_disease_model.keras"
+MODEL_PATH = "plant_disease_model.keras"
 model = tf.keras.models.load_model(MODEL_PATH)
 
 # Define initial class names for plant diseases
