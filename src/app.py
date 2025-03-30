@@ -56,6 +56,8 @@ pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
 
 warnings.filterwarnings("ignore", category=UserWarning, module='urllib3')
+# Suppress HDF5 legacy warning
+warnings.filterwarnings("ignore", category=UserWarning, message=".*HDF5 file via `model.save()`.*")
 
 # Database Models
 class User(Base):
@@ -88,11 +90,11 @@ class Retraining(Base):
 
 Base.metadata.create_all(bind=engine)
 
-# Define base directory and paths for Railway
-BASE_DIR = os.path.abspath(os.path.dirname(__file__))  # Adjust if code is in src/: os.path.join(os.path.dirname(__file__), "..")
+# Define base directory and paths for Railway (assuming code is in src/)
+BASE_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 UPLOAD_DIR = os.path.join(BASE_DIR, "data")
 VISUALIZATION_DIR = os.path.join(BASE_DIR, "static/visualizations")
-MODEL_DIR = os.path.join(BASE_DIR, "../models")
+MODEL_DIR = os.path.join(BASE_DIR, "models")
 MODEL_PATH = os.path.join(MODEL_DIR, "plant_disease_model.h5")
 
 # Create directories upfront
@@ -419,7 +421,7 @@ async def retrain(files: List[UploadFile] = File(...),
                 if image_count >= 2:
                     class_counts[class_dir] = image_count
                 else:
-                    shutil.rm-tree(class_path)
+                    shutil.rmtree(class_path)
                     logger.info(f"Removed class {class_dir} with insufficient samples ({image_count})")
         
         if not class_counts:
