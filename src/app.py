@@ -240,31 +240,110 @@ def extract_zip(zip_path, extract_to):
     with zipfile.ZipFile(zip_path, 'r') as zip_ref:
         zip_ref.extractall(extract_to)
 
-def save_visualizations(y_true, y_pred_classes, target_names):
-    """Save classification report and confusion matrix as PNG files."""
-    class_report = classification_report(y_true, y_pred_classes, target_names=target_names)
+def save_visualizations(y_true, y_pred_classes, target_names, history=None):
+    """Save enhanced visualizations including classification report, confusion matrix, and training plots."""
+    # 1. Beautified Classification Report
+    class_report = classification_report(y_true, y_pred_classes, target_names=target_names, output_dict=True)
     
-    plt.figure(figsize=(10, len(target_names) * 0.5 + 2))
-    plt.text(0.01, 0.99, class_report, {'fontsize': 10}, fontfamily='monospace')
-    plt.axis('off')
-    plt.title("Classification Report")
-    plt.savefig(os.path.join(VISUALIZATION_DIR, "classification_report.png"),
-                bbox_inches='tight', dpi=300)
+    # Prepare data for the table
+    headers = ["Class", "Precision", "Recall", "F1-Score", "Support"]
+    rows = []
+    for cls in target_names:
+        if cls in class_report:
+            rows.append([
+                cls,
+                f"{class_report[cls]['precision']:.2f}",
+                f"{class_report[cls]['recall']:.2f}",
+                f"{class_report[cls]['f1-score']:.2f}",
+                f"{class_report[cls]['support']}"
+            ])
+    # Add accuracy row
+    total_support = sum(class_report[cls]['support'] for cls in target_names if cls in class_report)
+    rows.append(["Accuracy", "", "", f"{class_report['accuracy']:.2f}", f"{total_support}"])
+
+    # Create the figure
+    fig, ax = plt.subplots(figsize=(12, len(target_names) * 0.6 + 2))  # Adjust height based on number of classes
+    ax.axis('off')
+    
+    # Create a table
+    table = ax.table(
+        cellText=rows,
+        colLabels=headers,
+        loc='center',
+        cellLoc='center',
+        colColours=['#4CAF50'] * len(headers),  # Green header background
+        colWidths=[0.4, 0.15, 0.15, 0.15, 0.15],  # Adjust column widths
+    )
+    
+    # Style the table
+    table.auto_set_font_size(False)
+    table.set_fontsize(12)
+    table.scale(1.2, 1.5)  # Scale table for better readability
+    
+    for (row, col), cell in table.get_celld().items():
+        if row == 0:  # Header row
+            cell.set_text_props(weight='bold', color='white')
+            cell.set_facecolor('#4CAF50')  # Green background for headers
+        else:  # Data rows
+            cell.set_text_props(color='black')
+            cell.set_facecolor('#F5F5F5' if row % 2 == 0 else '#FFFFFF')  # Alternating row colors
+        cell.set_edgecolor('#D3D3D3')  # Light gray borders
+    
+    # Add title
+    plt.title("Classification Report", fontsize=18, weight='bold', pad=20, color='#333333')
+    
+    # Save the figure
+    plt.savefig(
+        os.path.join(VISUALIZATION_DIR, "classification_report.png"),
+        bbox_inches='tight',
+        dpi=300,
+        facecolor='white',
+        edgecolor='none'
+    )
     plt.close()
 
+    # 2. Confusion Matrix (unchanged from your original)
     cm = confusion_matrix(y_true, y_pred_classes)
     plt.figure(figsize=(max(10, len(target_names)), max(10, len(target_names))))
-    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
-                xticklabels=target_names, yticklabels=target_names)
-    plt.title("Confusion Matrix")
-    plt.ylabel('True Label')
-    plt.xlabel('Predicted Label')
-    plt.xticks(rotation=45, ha='right')
-    plt.yticks(rotation=0)
+    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', xticklabels=target_names, yticklabels=target_names, cbar=True)
+    plt.title("Confusion Matrix", fontsize=16, pad=20)
+    plt.ylabel('True Label', fontsize=12)
+    plt.xlabel('Predicted Label', fontsize=12)
+    plt.xticks(rotation=45, ha='right', fontsize=10)
+    plt.yticks(rotation=0, fontsize=10)
     plt.tight_layout()
-    plt.savefig(os.path.join(VISUALIZATION_DIR, "confusion_matrix.png"),
-                bbox_inches='tight', dpi=300)
+    plt.savefig(os.path.join(VISUALIZATION_DIR, "confusion_matrix.png"), bbox_inches='tight', dpi=300)
     plt.close()
+
+    # 3. Training and Validation Loss (unchanged)
+    if history and 'loss' in history.history:
+        plt.figure(figsize=(10, 6))
+        plt.plot(history.history['loss'], label='Training Loss', color='blue', linewidth=2)
+        if 'val_loss' in history.history:
+            plt.plot(history.history['val_loss'], label='Validation Loss', color='orange', linewidth=2)
+        plt.title('Training and Validation Loss', fontsize=16, pad=20)
+        plt.xlabel('Epoch', fontsize=12)
+        plt.ylabel('Loss', fontsize=12)
+        plt.legend(fontsize=10)
+        plt.grid(True, linestyle='--', alpha=0.7)
+        plt.tight_layout()
+        plt.savefig(os.path.join(VISUALIZATION_DIR, "loss_plot.png"), bbox_inches='tight', dpi=300)
+        plt.close()
+
+    # 4. Training and Validation Accuracy (unchanged)
+    if history and 'accuracy' in history.history:
+        plt.figure(figsize=(10, 6))
+        plt.plot(history.history['accuracy'], label='Training Accuracy', color='blue', linewidth=2)
+        if 'val_accuracy' in history.history:
+            plt.plot(history.history['val_accuracy'], label='Validation Accuracy', color='orange', linewidth=2)
+        plt.title('Training and Validation Accuracy', fontsize=16, pad=20)
+        plt.xlabel('Epoch', fontsize=12)
+        plt.ylabel('Accuracy', fontsize=12)
+        plt.legend(fontsize=10)
+        plt.grid(True, linestyle='--', alpha=0.7)
+        plt.tight_layout()
+        plt.savefig(os.path.join(VISUALIZATION_DIR, "accuracy_plot.png"), bbox_inches='tight', dpi=300)
+        plt.close()
 
 @app.post("/retrain")
 async def retrain(files: List[UploadFile] = File(...),
@@ -297,7 +376,7 @@ async def retrain(files: List[UploadFile] = File(...),
                 print(f"Contents of extract_dir: {os.listdir(extract_dir)}")
                 
                 # Process train and val subdirectories
-                for subdir in ['train', 'val','test']:
+                for subdir in ['train', 'val', 'test']:
                     subdir_path = os.path.join(extract_dir, subdir)
                     if os.path.exists(subdir_path) and os.path.isdir(subdir_path):
                         print(f"Processing {subdir}: {os.listdir(subdir_path)}")
@@ -451,8 +530,8 @@ async def retrain(files: List[UploadFile] = File(...),
             output_dict=True
         )
         
-        # 8. Save visualizations
-        save_visualizations(y_true, y_pred_classes, target_names)
+        # 8. Save visualizations with history
+        save_visualizations(y_true, y_pred_classes, target_names, history)
         
         # 9. Save the fine-tuned model
         fine_tuned_model_path = os.path.join(os.path.dirname(MODEL_PATH), "plant_disease_model.h5")
@@ -501,7 +580,9 @@ async def retrain(files: List[UploadFile] = File(...),
             "fine_tuned_model_path": fine_tuned_model_path,
             "visualization_files": {
                 "classification_report": f"{base_url}/visualizations/classification_report.png",
-                "confusion_matrix": f"{base_url}/visualizations/confusion_matrix.png"
+                "confusion_matrix": f"{base_url}/visualizations/confusion_matrix.png",
+                "loss_plot": f"{base_url}/visualizations/loss_plot.png",
+                "accuracy_plot": f"{base_url}/visualizations/accuracy_plot.png"
             },
             "retraining_id": retraining.id,
             "user_id": current_user.id
