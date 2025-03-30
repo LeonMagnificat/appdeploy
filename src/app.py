@@ -4,6 +4,7 @@ import zipfile
 import io
 import json
 import warnings
+import logging
 from datetime import datetime, timedelta
 from typing import List
 
@@ -27,19 +28,26 @@ from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session, relationship
 
 from dotenv import load_dotenv
+import secrets
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # Load environment variables
 load_dotenv()
 
 # Database configuration
 DATABASE_URL = os.getenv("DATABASE_URL")
+if not DATABASE_URL:
+    raise ValueError("DATABASE_URL environment variable is not set")
 DATABASE_URL = DATABASE_URL.replace("mysql://", "mysql+mysqlconnector://", 1)
 engine = create_engine(DATABASE_URL)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
 # JWT Configuration
-SECRET_KEY = os.getenv("SECRET_KEY", "your-secret-key")
+SECRET_KEY = os.getenv("SECRET_KEY", secrets.token_hex(32))  # Generate secure key if not set
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = 30
 
@@ -86,7 +94,7 @@ Base.metadata.create_all(bind=engine)
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 UPLOAD_DIR = os.path.join(BASE_DIR, "Data")
 VISUALIZATION_DIR = os.path.join(BASE_DIR, "visualizations")
-MODEL_PATH = os.path.join(BASE_DIR, "../models/plant_disease_model.h5")
+MODEL_PATH = os.path.join(BASE_DIR, "../models/plant_disease_model.h5")  # Changed back to .h5
 
 # Create directories upfront
 os.makedirs(UPLOAD_DIR, exist_ok=True)
@@ -98,37 +106,43 @@ app = FastAPI()
 # Mount static files after directory creation
 app.mount("/visualizations", StaticFiles(directory=VISUALIZATION_DIR), name="visualizations")
 
-# Add CORS middleware
+# Add CORS middleware (restrict in production)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["https://leafsense.vercel.app"],  # Restrict to specific origins in production
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+# Load or initialize class names
+CLASS_NAMES_PATH = os.path.join(os.path.dirname(MODEL_PATH), "class_names.json")
+CLASS_NAMES = []
+if os.path.exists(CLASS_NAMES_PATH):
+    with open(CLASS_NAMES_PATH, "r") as f:
+        CLASS_NAMES = json.load(f)
+else:
+    CLASS_NAMES = [
+        'Apple___Apple_scab', 'Apple___Black_rot', 'Apple___Cedar_apple_rust', 'Apple___healthy',
+        'Blueberry___healthy', 'Cherry_(including_sour)___Powdery_mildew', 'Cherry_(including_sour)___healthy',
+        'Corn_(maize)___Cercospora_leaf_spot Gray_leaf_spot', 'Corn_(maize)___Common_rust_',
+        'Corn_(maize)___Northern_Leaf_Blight', 'Corn_(maize)___healthy', 'Grape___Black_rot',
+        'Grape___Esca_(Black_Measles)', 'Grape___Leaf_blight_(Isariopsis_Leaf_Spot)', 'Grape___healthy',
+        'Orange___Haunglongbing_(Citrus_greening)', 'Peach___Bacterial_spot', 'Peach___healthy',
+        'Pepper,_bell___Bacterial_spot', 'Pepper,_bell___healthy', 'Potato___Early_blight', 'Potato___Late_blight',
+        'Potato___healthy', 'Raspberry___healthy', 'Soybean___healthy', 'Squash___Powdery_mildew',
+        'Strawberry___Leaf_scorch', 'Strawberry___healthy', 'Tomato___Bacterial_spot', 'Tomato___Early_blight',
+        'Tomato___Late_blight', 'Tomato___Leaf_Mold', 'Tomato___Septoria_leaf_spot',
+        'Tomato___Spider_mites Two-spotted_spider_mite', 'Tomato___Target_Spot', 'Tomato___Tomato_Yellow_Leaf_Curl_Virus',
+        'Tomato___Tomato_mosaic_virus', 'Tomato___healthy'
+    ]
+
 # Load model
-print(f"Model path: {MODEL_PATH}")
-print(f"Does the model file exist? {os.path.exists(MODEL_PATH)}")
+logger.info(f"Model path: {MODEL_PATH}")
+logger.info(f"Does the model file exist? {os.path.exists(MODEL_PATH)}")
 if not os.path.exists(MODEL_PATH):
     raise FileNotFoundError(f"Model file not found at {MODEL_PATH}")
 model = tf.keras.models.load_model(MODEL_PATH)
-
-# Define initial class names for plant diseases
-CLASS_NAMES = [
-    'Apple___Apple_scab', 'Apple___Black_rot', 'Apple___Cedar_apple_rust', 'Apple___healthy',
-    'Blueberry___healthy', 'Cherry_(including_sour)___Powdery_mildew', 'Cherry_(including_sour)___healthy',
-    'Corn_(maize)___Cercospora_leaf_spot Gray_leaf_spot', 'Corn_(maize)___Common_rust_',
-    'Corn_(maize)___Northern_Leaf_Blight', 'Corn_(maize)___healthy', 'Grape___Black_rot',
-    'Grape___Esca_(Black_Measles)', 'Grape___Leaf_blight_(Isariopsis_Leaf_Spot)', 'Grape___healthy',
-    'Orange___Haunglongbing_(Citrus_greening)', 'Peach___Bacterial_spot', 'Peach___healthy',
-    'Pepper,_bell___Bacterial_spot', 'Pepper,_bell___healthy', 'Potato___Early_blight', 'Potato___Late_blight',
-    'Potato___healthy', 'Raspberry___healthy', 'Soybean___healthy', 'Squash___Powdery_mildew',
-    'Strawberry___Leaf_scorch', 'Strawberry___healthy', 'Tomato___Bacterial_spot', 'Tomato___Early_blight',
-    'Tomato___Late_blight', 'Tomato___Leaf_Mold', 'Tomato___Septoria_leaf_spot',
-    'Tomato___Spider_mites Two-spotted_spider_mite', 'Tomato___Target_Spot', 'Tomato___Tomato_Yellow_Leaf_Curl_Virus',
-    'Tomato___Tomato_mosaic_virus', 'Tomato___healthy'
-]
 
 # Pydantic models for request/response
 class UserCreate(BaseModel):
@@ -185,10 +199,14 @@ async def get_current_user(token: str = Depends(oauth2_scheme), db: Session = De
 
 def preprocess_image(img_bytes: bytes):
     """Preprocess image for prediction."""
-    img = image.load_img(io.BytesIO(img_bytes), target_size=(128, 128))
-    img_array = image.img_to_array(img) / 255.0
-    img_array = np.expand_dims(img_array, axis=0)
-    return img_array
+    try:
+        img = image.load_img(io.BytesIO(img_bytes), target_size=(128, 128))
+        img_array = image.img_to_array(img) / 255.0
+        img_array = np.expand_dims(img_array, axis=0)
+        return img_array
+    except Exception as e:
+        logger.error(f"Error preprocessing image: {str(e)}")
+        raise HTTPException(status_code=400, detail=f"Invalid image: {str(e)}")
 
 # Authentication endpoints
 @app.post("/signup", response_model=Token)
@@ -221,22 +239,26 @@ async def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = 
 async def predict(file: UploadFile = File(...),
                  db: Session = Depends(get_db),
                  current_user: User = Depends(get_current_user)):
-    img_bytes = await file.read()
-    img = preprocess_image(img_bytes)
-    predictions = model.predict(img)
-    predicted_index = np.argmax(predictions, axis=1)[0]
-    confidence = np.max(predictions)
-    disease = CLASS_NAMES[predicted_index]
-    
-    prediction = Prediction(
-        user_id=current_user.id,
-        predicted_disease=disease,
-        confidence=float(confidence)
-    )
-    db.add(prediction)
-    db.commit()
-    
-    return JSONResponse(content={"prediction": disease, "confidence": float(confidence)})
+    try:
+        img_bytes = await file.read()
+        img = preprocess_image(img_bytes)
+        predictions = model.predict(img)
+        predicted_index = np.argmax(predictions, axis=1)[0]
+        confidence = np.max(predictions)
+        disease = CLASS_NAMES[predicted_index]
+        
+        prediction = Prediction(
+            user_id=current_user.id,
+            predicted_disease=disease,
+            confidence=float(confidence)
+        )
+        db.add(prediction)
+        db.commit()
+        
+        return JSONResponse(content={"prediction": disease, "confidence": float(confidence)})
+    except Exception as e:
+        logger.error(f"Prediction error: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Prediction failed: {str(e)}")
 
 def extract_zip(zip_path, extract_to):
     """Extract ZIP files."""
@@ -356,6 +378,9 @@ async def retrain(files: List[UploadFile] = File(...),
         extracted_dirs = []
         
         for file in files:
+            if not file.filename.lower().endswith(('.zip', '.jpg', '.jpeg', '.png')):
+                raise HTTPException(status_code=400, detail=f"Unsupported file type: {file.filename}")
+            
             file_path = os.path.join(UPLOAD_DIR, file.filename)
             with open(file_path, "wb") as buffer:
                 shutil.copyfileobj(file.file, buffer)
@@ -367,13 +392,13 @@ async def retrain(files: List[UploadFile] = File(...),
                 extracted_dirs.append(extract_dir)
                 os.remove(file_path)
                 
-                print(f"Extracted ZIP to: {extract_dir}")
-                print(f"Contents of extract_dir: {os.listdir(extract_dir)}")
+                logger.info(f"Extracted ZIP to: {extract_dir}")
+                logger.info(f"Contents of extract_dir: {os.listdir(extract_dir)}")
                 
                 for subdir in ['train', 'val', 'test']:
                     subdir_path = os.path.join(extract_dir, subdir)
                     if os.path.exists(subdir_path) and os.path.isdir(subdir_path):
-                        print(f"Processing {subdir}: {os.listdir(subdir_path)}")
+                        logger.info(f"Processing {subdir}: {os.listdir(subdir_path)}")
                         for class_name in os.listdir(subdir_path):
                             class_path = os.path.join(subdir_path, class_name)
                             if os.path.isdir(class_path) and class_name not in ['__MACOSX']:
@@ -393,7 +418,7 @@ async def retrain(files: List[UploadFile] = File(...),
                 if image_count >= 2:
                     class_counts[class_dir] = image_count
                 else:
-                    print(f"Skipping class {class_dir} with insufficient samples ({image_count})")
+                    logger.warning(f"Skipping class {class_dir} with insufficient samples ({image_count})")
                     shutil.rmtree(class_path)
         
         if not class_counts:
@@ -404,7 +429,7 @@ async def retrain(files: List[UploadFile] = File(...),
                                for class_dir in os.listdir(new_data_dir) if os.path.isdir(os.path.join(new_data_dir, class_dir))}
             })
         
-        print(f"Valid classes and image counts: {class_counts}")
+        logger.info(f"Valid classes and image counts: {class_counts}")
         
         # 3. Create data generators
         target_names = list(class_counts.keys())
@@ -458,7 +483,7 @@ async def retrain(files: List[UploadFile] = File(...),
         
         # 4. Create a new model for fine-tuning
         temp_model_path = os.path.join(os.path.dirname(MODEL_PATH), "temp_model.h5")
-        model.save(temp_model_path)
+        model.save(temp_model_path)  # Save in .h5 format
         working_model = tf.keras.models.load_model(temp_model_path)
         
         num_layers = len(working_model.layers)
@@ -529,11 +554,11 @@ async def retrain(files: List[UploadFile] = File(...),
         
         # 9. Save the fine-tuned model
         fine_tuned_model_path = os.path.join(os.path.dirname(MODEL_PATH), "plant_disease_model.h5")
-        working_model.save(fine_tuned_model_path)
+        working_model.save(fine_tuned_model_path)  # Save in .h5 format
         model = tf.keras.models.load_model(fine_tuned_model_path)
         
         CLASS_NAMES = all_classes
-        with open(os.path.join(os.path.dirname(MODEL_PATH), "class_names.json"), "w") as f:
+        with open(CLASS_NAMES_PATH, "w") as f:
             json.dump(CLASS_NAMES, f)
         
         # 10. Prepare metrics and save to database
@@ -562,8 +587,8 @@ async def retrain(files: List[UploadFile] = File(...),
         db.add(retraining)
         db.commit()
         
-        # 11. Prepare response
-        base_url = "https://appdeploy-production.up.railway.app"  # Adjust for production
+        # 11. Prepare response (use environment variable for base URL)
+        BASE_URL = os.getenv("BASE_URL", "http://localhost:8000")
         response_content = {
             "message": "Model fine-tuning successful!",
             "num_classes": len(CLASS_NAMES),
@@ -573,10 +598,10 @@ async def retrain(files: List[UploadFile] = File(...),
             "class_metrics": class_metrics,
             "fine_tuned_model_path": fine_tuned_model_path,
             "visualization_files": {
-                "classification_report": f"{base_url}/visualizations/classification_report.png",
-                "confusion_matrix": f"{base_url}/visualizations/confusion_matrix.png",
-                "loss_plot": f"{base_url}/visualizations/loss_plot.png",
-                "accuracy_plot": f"{base_url}/visualizations/accuracy_plot.png"
+                "classification_report": f"{BASE_URL}/visualizations/classification_report.png",
+                "confusion_matrix": f"{BASE_URL}/visualizations/confusion_matrix.png",
+                "loss_plot": f"{BASE_URL}/visualizations/loss_plot.png",
+                "accuracy_plot": f"{BASE_URL}/visualizations/accuracy_plot.png"
             },
             "retraining_id": retraining.id,
             "user_id": current_user.id
@@ -590,11 +615,8 @@ async def retrain(files: List[UploadFile] = File(...),
     except HTTPException as he:
         raise he
     except Exception as e:
-        import traceback
-        return JSONResponse(content={
-            "error": str(e),
-            "details": traceback.format_exc()
-        }, status_code=500)
+        logger.error(f"Error during retraining: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Retraining failed: {str(e)}")
     
     finally:
         for extract_dir in extracted_dirs:
