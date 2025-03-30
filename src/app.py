@@ -6,6 +6,8 @@ import json
 import warnings
 from datetime import datetime, timedelta
 from typing import List
+import base64
+from bson import ObjectId
 
 import numpy as np
 import tensorflow as tf
@@ -13,6 +15,7 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 from tensorflow.keras.preprocessing import image
 from sklearn.metrics import classification_report, confusion_matrix
+from pymongo import MongoClient
 
 from fastapi import FastAPI, UploadFile, File, HTTPException, Depends, status
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -25,24 +28,23 @@ from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, 
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session, relationship
 
-from pymongo import MongoClient
-from gridfs import GridFS
 from dotenv import load_dotenv
 
 # Load environment variables
 load_dotenv()
 
-# Database configuration (SQL)
-DATABASE_URL = os.getenv("DATABASE_URL").replace("mysql://", "mysql+mysqlconnector://", 1)
+# Database configuration (SQLAlchemy for users/predictions, MongoDB for visualizations)
+DATABASE_URL = os.getenv("DATABASE_URL")
+DATABASE_URL = DATABASE_URL.replace("mysql://", "mysql+mysqlconnector://", 1)
 engine = create_engine(DATABASE_URL)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
 # MongoDB configuration
-MONGO_URI = os.getenv("MONGO_URI")
+MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017")
 mongo_client = MongoClient(MONGO_URI)
-db = mongo_client["plant_disease_db"]  # Replace with your database name
-fs = GridFS(db)  # GridFS instance for storing files
+mongo_db = mongo_client["plant_disease_db"]
+visualizations_collection = mongo_db["visualizations"]
 
 # JWT Configuration
 SECRET_KEY = os.getenv("SECRET_KEY", "your-secret-key")
@@ -57,7 +59,7 @@ oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
 
 warnings.filterwarnings("ignore", category=UserWarning, module='urllib3')
 
-# Database Models (SQL)
+# SQLAlchemy Models
 class User(Base):
     __tablename__ = "users"
     id = Column(Integer, primary_key=True, index=True)
@@ -244,16 +246,9 @@ def extract_zip(zip_path, extract_to):
     with zipfile.ZipFile(zip_path, 'r') as zip_ref:
         zip_ref.extractall(extract_to)
 
-def save_visualizations(y_true, y_pred_classes, target_names, history=None):
-    """Save visualizations to MongoDB GridFS and return their IDs."""
-    plot_files = {
-        "classification_report": "classification_report.png",
-        "confusion_matrix": "confusion_matrix.png",
-        "loss_plot": "loss_plot.png",
-        "accuracy_plot": "accuracy_plot.png"
-    }
-    
-    visualization_ids = {}
+def save_visualizations_to_mongo(y_true, y_pred_classes, target_names, history=None):
+    """Save visualizations to MongoDB and return their IDs."""
+    viz_ids = {}
 
     # 1. Classification Report
     class_report = classification_report(y_true, y_pred_classes, target_names=target_names, output_dict=True)
@@ -273,7 +268,8 @@ def save_visualizations(y_true, y_pred_classes, target_names, history=None):
 
     fig, ax = plt.subplots(figsize=(12, len(target_names) * 0.6 + 2))
     ax.axis('off')
-    table = ax.table(cellText=rows, colLabels=headers, loc='center', cellLoc='center', colColours=['#4CAF50'] * 5, colWidths=[0.4, 0.15, 0.15, 0.15, 0.15])
+    table = ax.table(cellText=rows, colLabels=headers, loc='center', cellLoc='center',
+                     colColours=['#4CAF50'] * len(headers), colWidths=[0.4, 0.15, 0.15, 0.15, 0.15])
     table.auto_set_font_size(False)
     table.set_fontsize(12)
     table.scale(1.2, 1.5)
@@ -286,11 +282,10 @@ def save_visualizations(y_true, y_pred_classes, target_names, history=None):
             cell.set_facecolor('#F5F5F5' if row % 2 == 0 else '#FFFFFF')
         cell.set_edgecolor('#D3D3D3')
     plt.title("Classification Report", fontsize=18, weight='bold', pad=20, color='#333333')
-    
     buf = io.BytesIO()
-    plt.savefig(buf, format='png', bbox_inches='tight', dpi=300, facecolor='white')
+    plt.savefig(buf, format='png', bbox_inches='tight', dpi=300)
     buf.seek(0)
-    visualization_ids["classification_report"] = str(fs.put(buf, filename="classification_report.png"))
+    viz_ids["classification_report"] = str(visualizations_collection.insert_one({"image": buf.read(), "type": "classification_report"}).inserted_id)
     plt.close()
     buf.close()
 
@@ -304,15 +299,14 @@ def save_visualizations(y_true, y_pred_classes, target_names, history=None):
     plt.xticks(rotation=45, ha='right', fontsize=10)
     plt.yticks(rotation=0, fontsize=10)
     plt.tight_layout()
-    
     buf = io.BytesIO()
     plt.savefig(buf, format='png', bbox_inches='tight', dpi=300)
     buf.seek(0)
-    visualization_ids["confusion_matrix"] = str(fs.put(buf, filename="confusion_matrix.png"))
+    viz_ids["confusion_matrix"] = str(visualizations_collection.insert_one({"image": buf.read(), "type": "confusion_matrix"}).inserted_id)
     plt.close()
     buf.close()
 
-    # 3. Loss Plot
+    # 3. Training and Validation Loss
     if history and 'loss' in history.history:
         plt.figure(figsize=(10, 6))
         plt.plot(history.history['loss'], label='Training Loss', color='blue', linewidth=2)
@@ -324,15 +318,14 @@ def save_visualizations(y_true, y_pred_classes, target_names, history=None):
         plt.legend(fontsize=10)
         plt.grid(True, linestyle='--', alpha=0.7)
         plt.tight_layout()
-        
         buf = io.BytesIO()
         plt.savefig(buf, format='png', bbox_inches='tight', dpi=300)
         buf.seek(0)
-        visualization_ids["loss_plot"] = str(fs.put(buf, filename="loss_plot.png"))
+        viz_ids["loss_plot"] = str(visualizations_collection.insert_one({"image": buf.read(), "type": "loss_plot"}).inserted_id)
         plt.close()
         buf.close()
 
-    # 4. Accuracy Plot
+    # 4. Training and Validation Accuracy
     if history and 'accuracy' in history.history:
         plt.figure(figsize=(10, 6))
         plt.plot(history.history['accuracy'], label='Training Accuracy', color='blue', linewidth=2)
@@ -344,15 +337,14 @@ def save_visualizations(y_true, y_pred_classes, target_names, history=None):
         plt.legend(fontsize=10)
         plt.grid(True, linestyle='--', alpha=0.7)
         plt.tight_layout()
-        
         buf = io.BytesIO()
         plt.savefig(buf, format='png', bbox_inches='tight', dpi=300)
         buf.seek(0)
-        visualization_ids["accuracy_plot"] = str(fs.put(buf, filename="accuracy_plot.png"))
+        viz_ids["accuracy_plot"] = str(visualizations_collection.insert_one({"image": buf.read(), "type": "accuracy_plot"}).inserted_id)
         plt.close()
         buf.close()
 
-    return visualization_ids
+    return viz_ids
 
 @app.post("/retrain")
 async def retrain(files: List[UploadFile] = File(...),
@@ -368,6 +360,7 @@ async def retrain(files: List[UploadFile] = File(...),
     try:
         # 1. Process uploaded files
         extracted_dirs = []
+        
         for file in files:
             file_path = os.path.join(UPLOAD_DIR, file.filename)
             with open(file_path, "wb") as buffer:
@@ -529,7 +522,7 @@ async def retrain(files: List[UploadFile] = File(...),
         )
         
         # 8. Save visualizations to MongoDB
-        visualization_ids = save_visualizations(y_true, y_pred_classes, target_names, history)
+        viz_ids = save_visualizations_to_mongo(y_true, y_pred_classes, target_names, history)
         
         # 9. Save the fine-tuned model
         fine_tuned_model_path = os.path.join(os.path.dirname(MODEL_PATH), "plant_disease_model.h5")
@@ -566,15 +559,15 @@ async def retrain(files: List[UploadFile] = File(...),
         db.add(retraining)
         db.commit()
         
-        # 11. Prepare response with visualization URLs
-        base_url = os.getenv("BASE_URL", "https://appdeploy-production.up.railway.app")
+        # 11. Prepare response with visualization IDs
+        base_url = os.getenv("BASE_URL", "")
         visualization_files = {
-            "classification_report": f"{base_url}/visualizations/{visualization_ids.get('classification_report', '')}",
-            "confusion_matrix": f"{base_url}/visualizations/{visualization_ids.get('confusion_matrix', '')}",
-            "loss_plot": f"{base_url}/visualizations/{visualization_ids.get('loss_plot', '')}",
-            "accuracy_plot": f"{base_url}/visualizations/{visualization_ids.get('accuracy_plot', '')}"
+            "classification_report": f"{base_url}/visualization/{viz_ids.get('classification_report')}",
+            "confusion_matrix": f"{base_url}/visualization/{viz_ids.get('confusion_matrix')}",
+            "loss_plot": f"{base_url}/visualization/{viz_ids.get('loss_plot')}" if "loss_plot" in viz_ids else None,
+            "accuracy_plot": f"{base_url}/visualization/{viz_ids.get('accuracy_plot')}" if "accuracy_plot" in viz_ids else None
         }
-
+        
         response_content = {
             "message": "Model fine-tuning successful!",
             "num_classes": len(CLASS_NAMES),
@@ -612,13 +605,15 @@ async def retrain(files: List[UploadFile] = File(...),
         if os.path.exists(temp_model_path):
             os.remove(temp_model_path)
 
-@app.get("/visualizations/{file_id}")
-async def get_visualization(file_id: str):
+@app.get("/visualization/{viz_id}")
+async def get_visualization(viz_id: str):
     try:
-        grid_out = fs.get(file_id)
-        return StreamingResponse(grid_out, media_type="image/png")
-    except Exception as e:
-        raise HTTPException(status_code=404, detail=f"Visualization not found: {str(e)}")
+        viz = visualizations_collection.find_one({"_id": ObjectId(viz_id)})
+        if not viz or "image" not in viz:
+            raise HTTPException(status_code=404, detail="Visualization not found")
+        return StreamingResponse(io.BytesIO(viz["image"]), media_type="image/png")
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid visualization ID")
 
 @app.get("/")
 def read_root():
