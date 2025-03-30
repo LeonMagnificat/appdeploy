@@ -569,7 +569,7 @@ async def retrain(files: List[UploadFile] = File(...),
         db.commit()
         
         # 11. Prepare response
-        base_url = "http://127.0.0.1:8000"  # Adjust for production
+        base_url = "https://appdeploy-production.up.railway.app"  # Adjust for production
         response_content = {
             "message": "Model fine-tuning successful!",
             "num_classes": len(CLASS_NAMES),
