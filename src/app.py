@@ -4,6 +4,7 @@ import zipfile
 import io
 import json
 import warnings
+import logging
 from datetime import datetime, timedelta
 from typing import List
 
@@ -28,12 +29,17 @@ from sqlalchemy.orm import sessionmaker, Session, relationship
 
 from dotenv import load_dotenv
 
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
 # Load environment variables
 load_dotenv()
 
-# Database configuration
-DATABASE_URL = os.getenv("DATABASE_URL")
-DATABASE_URL = DATABASE_URL.replace("mysql://", "mysql+mysqlconnector://", 1)
+# Database configuration for Railway
+DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///app.db")  # Fallback to SQLite if not set
+if DATABASE_URL.startswith("mysql://"):
+    DATABASE_URL = DATABASE_URL.replace("mysql://", "mysql+mysqlconnector://", 1)
 engine = create_engine(DATABASE_URL)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
@@ -82,21 +88,22 @@ class Retraining(Base):
 
 Base.metadata.create_all(bind=engine)
 
-# Define base directory and paths
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-UPLOAD_DIR = os.path.join(BASE_DIR, "Data")
-VISUALIZATION_DIR = os.path.join(BASE_DIR, "visualizations")
-MODEL_PATH = os.path.join(BASE_DIR, "../models/plant_disease_model.h5")
+# Define base directory and paths for Railway
+BASE_DIR = os.path.abspath(os.path.dirname(__file__))  # Adjust if code is in src/: os.path.join(os.path.dirname(__file__), "..")
+UPLOAD_DIR = os.path.join(BASE_DIR, "data")
+VISUALIZATION_DIR = os.path.join(BASE_DIR, "static/visualizations")
+MODEL_DIR = os.path.join(BASE_DIR, "../models")
+MODEL_PATH = os.path.join(MODEL_DIR, "plant_disease_model.h5")
 
 # Create directories upfront
-os.makedirs(UPLOAD_DIR, exist_ok=True)
-os.makedirs(VISUALIZATION_DIR, exist_ok=True)
+for directory in [UPLOAD_DIR, VISUALIZATION_DIR, MODEL_DIR]:
+    os.makedirs(directory, exist_ok=True)
 
 # Initialize FastAPI app
 app = FastAPI()
 
-# Mount static files after directory creation
-app.mount("/visualizations", StaticFiles(directory=VISUALIZATION_DIR), name="visualizations")
+# Mount static files for visualizations
+app.mount("/static/visualizations", StaticFiles(directory=VISUALIZATION_DIR), name="visualizations")
 
 # Add CORS middleware
 app.add_middleware(
@@ -108,8 +115,8 @@ app.add_middleware(
 )
 
 # Load model
-print(f"Model path: {MODEL_PATH}")
-print(f"Does the model file exist? {os.path.exists(MODEL_PATH)}")
+logger.info(f"Model path: {MODEL_PATH}")
+logger.info(f"Does the model file exist? {os.path.exists(MODEL_PATH)}")
 if not os.path.exists(MODEL_PATH):
     raise FileNotFoundError(f"Model file not found at {MODEL_PATH}")
 model = tf.keras.models.load_model(MODEL_PATH)
@@ -190,6 +197,111 @@ def preprocess_image(img_bytes: bytes):
     img_array = np.expand_dims(img_array, axis=0)
     return img_array
 
+def extract_zip(zip_path, extract_to):
+    """Extract ZIP files."""
+    with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+        zip_ref.extractall(extract_to)
+
+def save_visualizations(y_true, y_pred_classes, target_names, history=None):
+    """Save enhanced visualizations including classification report, confusion matrix, and training plots."""
+    timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    
+    # 1. Classification Report
+    class_report = classification_report(y_true, y_pred_classes, target_names=target_names, output_dict=True)
+    
+    headers = ["Class", "Precision", "Recall", "F1-Score", "Support"]
+    rows = []
+    for cls in target_names:
+        if cls in class_report:
+            rows.append([
+                cls,
+                f"{class_report[cls]['precision']:.2f}",
+                f"{class_report[cls]['recall']:.2f}",
+                f"{class_report[cls]['f1-score']:.2f}",
+                f"{class_report[cls]['support']}"
+            ])
+    total_support = sum(class_report[cls]['support'] for cls in target_names if cls in class_report)
+    rows.append(["Accuracy", "", "", f"{class_report['accuracy']:.2f}", f"{total_support}"])
+
+    fig, ax = plt.subplots(figsize=(12, len(target_names) * 0.6 + 2))
+    ax.axis('off')
+    
+    table = ax.table(
+        cellText=rows,
+        colLabels=headers,
+        loc='center',
+        cellLoc='center',
+        colColours=['#4CAF50'] * len(headers),
+        colWidths=[0.4, 0.15, 0.15, 0.15, 0.15],
+    )
+    
+    table.auto_set_font_size(False)
+    table.set_fontsize(12)
+    table.scale(1.2, 1.5)
+    
+    for (row, col), cell in table.get_celld().items():
+        if row == 0:
+            cell.set_text_props(weight='bold', color='white')
+            cell.set_facecolor('#4CAF50')
+        else:
+            cell.set_text_props(color='black')
+            cell.set_facecolor('#F5F5F5' if row % 2 == 0 else '#FFFFFF')
+        cell.set_edgecolor('#D3D3D3')
+    
+    plt.title("Classification Report", fontsize=18, weight='bold', pad=20, color='#333333')
+    plt.savefig(
+        os.path.join(VISUALIZATION_DIR, f"classification_report_{timestamp}.png"),
+        bbox_inches='tight',
+        dpi=300,
+        facecolor='white'
+    )
+    plt.close()
+
+    # 2. Confusion Matrix
+    cm = confusion_matrix(y_true, y_pred_classes)
+    plt.figure(figsize=(max(10, len(target_names)), max(10, len(target_names))))
+    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', xticklabels=target_names, yticklabels=target_names, cbar=True)
+    plt.title("Confusion Matrix", fontsize=16, pad=20)
+    plt.ylabel('True Label', fontsize=12)
+    plt.xlabel('Predicted Label', fontsize=12)
+    plt.xticks(rotation=45, ha='right', fontsize=10)
+    plt.yticks(rotation=0, fontsize=10)
+    plt.tight_layout()
+    plt.savefig(os.path.join(VISUALIZATION_DIR, f"confusion_matrix_{timestamp}.png"), bbox_inches='tight', dpi=300)
+    plt.close()
+
+    # 3. Training and Validation Loss
+    if history and 'loss' in history.history:
+        plt.figure(figsize=(10, 6))
+        plt.plot(history.history['loss'], label='Training Loss', color='blue', linewidth=2)
+        if 'val_loss' in history.history:
+            plt.plot(history.history['val_loss'], label='Validation Loss', color='orange', linewidth=2)
+        plt.title('Training and Validation Loss', fontsize=16, pad=20)
+        plt.xlabel('Epoch', fontsize=12)
+        plt.ylabel('Loss', fontsize=12)
+        plt.legend(fontsize=10)
+        plt.grid(True, linestyle='--', alpha=0.7)
+        plt.tight_layout()
+        plt.savefig(os.path.join(VISUALIZATION_DIR, f"loss_plot_{timestamp}.png"), bbox_inches='tight', dpi=300)
+        plt.close()
+
+    # 4. Training and Validation Accuracy
+    if history and 'accuracy' in history.history:
+        plt.figure(figsize=(10, 6))
+        plt.plot(history.history['accuracy'], label='Training Accuracy', color='blue', linewidth=2)
+        if 'val_accuracy' in history.history:
+            plt.plot(history.history['val_accuracy'], label='Validation Accuracy', color='orange', linewidth=2)
+        plt.title('Training and Validation Accuracy', fontsize=16, pad=20)
+        plt.xlabel('Epoch', fontsize=12)
+        plt.ylabel('Accuracy', fontsize=12)
+        plt.legend(fontsize=10)
+        plt.grid(True, linestyle='--', alpha=0.7)
+        plt.tight_layout()
+        plt.savefig(os.path.join(VISUALIZATION_DIR, f"accuracy_plot_{timestamp}.png"), bbox_inches='tight', dpi=300)
+        plt.close()
+    
+    return timestamp
+
 # Authentication endpoints
 @app.post("/signup", response_model=Token)
 async def signup(user: UserCreate, db: Session = Depends(get_db)):
@@ -238,108 +350,6 @@ async def predict(file: UploadFile = File(...),
     
     return JSONResponse(content={"prediction": disease, "confidence": float(confidence)})
 
-def extract_zip(zip_path, extract_to):
-    """Extract ZIP files."""
-    with zipfile.ZipFile(zip_path, 'r') as zip_ref:
-        zip_ref.extractall(extract_to)
-
-def save_visualizations(y_true, y_pred_classes, target_names, history=None):
-    """Save enhanced visualizations including classification report, confusion matrix, and training plots."""
-    # 1. Beautified Classification Report
-    class_report = classification_report(y_true, y_pred_classes, target_names=target_names, output_dict=True)
-    
-    headers = ["Class", "Precision", "Recall", "F1-Score", "Support"]
-    rows = []
-    for cls in target_names:
-        if cls in class_report:
-            rows.append([
-                cls,
-                f"{class_report[cls]['precision']:.2f}",
-                f"{class_report[cls]['recall']:.2f}",
-                f"{class_report[cls]['f1-score']:.2f}",
-                f"{class_report[cls]['support']}"
-            ])
-    total_support = sum(class_report[cls]['support'] for cls in target_names if cls in class_report)
-    rows.append(["Accuracy", "", "", f"{class_report['accuracy']:.2f}", f"{total_support}"])
-
-    fig, ax = plt.subplots(figsize=(12, len(target_names) * 0.6 + 2))
-    ax.axis('off')
-    
-    table = ax.table(
-        cellText=rows,
-        colLabels=headers,
-        loc='center',
-        cellLoc='center',
-        colColours=['#4CAF50'] * len(headers),
-        colWidths=[0.4, 0.15, 0.15, 0.15, 0.15],
-    )
-    
-    table.auto_set_font_size(False)
-    table.set_fontsize(12)
-    table.scale(1.2, 1.5)
-    
-    for (row, col), cell in table.get_celld().items():
-        if row == 0:
-            cell.set_text_props(weight='bold', color='white')
-            cell.set_facecolor('#4CAF50')
-        else:
-            cell.set_text_props(color='black')
-            cell.set_facecolor('#F5F5F5' if row % 2 == 0 else '#FFFFFF')
-        cell.set_edgecolor('#D3D3D3')
-    
-    plt.title("Classification Report", fontsize=18, weight='bold', pad=20, color='#333333')
-    plt.savefig(
-        os.path.join(VISUALIZATION_DIR, "classification_report.png"),
-        bbox_inches='tight',
-        dpi=300,
-        facecolor='white',
-        edgecolor='none'
-    )
-    plt.close()
-
-    # 2. Confusion Matrix
-    cm = confusion_matrix(y_true, y_pred_classes)
-    plt.figure(figsize=(max(10, len(target_names)), max(10, len(target_names))))
-    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', xticklabels=target_names, yticklabels=target_names, cbar=True)
-    plt.title("Confusion Matrix", fontsize=16, pad=20)
-    plt.ylabel('True Label', fontsize=12)
-    plt.xlabel('Predicted Label', fontsize=12)
-    plt.xticks(rotation=45, ha='right', fontsize=10)
-    plt.yticks(rotation=0, fontsize=10)
-    plt.tight_layout()
-    plt.savefig(os.path.join(VISUALIZATION_DIR, "confusion_matrix.png"), bbox_inches='tight', dpi=300)
-    plt.close()
-
-    # 3. Training and Validation Loss
-    if history and 'loss' in history.history:
-        plt.figure(figsize=(10, 6))
-        plt.plot(history.history['loss'], label='Training Loss', color='blue', linewidth=2)
-        if 'val_loss' in history.history:
-            plt.plot(history.history['val_loss'], label='Validation Loss', color='orange', linewidth=2)
-        plt.title('Training and Validation Loss', fontsize=16, pad=20)
-        plt.xlabel('Epoch', fontsize=12)
-        plt.ylabel('Loss', fontsize=12)
-        plt.legend(fontsize=10)
-        plt.grid(True, linestyle='--', alpha=0.7)
-        plt.tight_layout()
-        plt.savefig(os.path.join(VISUALIZATION_DIR, "loss_plot.png"), bbox_inches='tight', dpi=300)
-        plt.close()
-
-    # 4. Training and Validation Accuracy
-    if history and 'accuracy' in history.history:
-        plt.figure(figsize=(10, 6))
-        plt.plot(history.history['accuracy'], label='Training Accuracy', color='blue', linewidth=2)
-        if 'val_accuracy' in history.history:
-            plt.plot(history.history['val_accuracy'], label='Validation Accuracy', color='orange', linewidth=2)
-        plt.title('Training and Validation Accuracy', fontsize=16, pad=20)
-        plt.xlabel('Epoch', fontsize=12)
-        plt.ylabel('Accuracy', fontsize=12)
-        plt.legend(fontsize=10)
-        plt.grid(True, linestyle='--', alpha=0.7)
-        plt.tight_layout()
-        plt.savefig(os.path.join(VISUALIZATION_DIR, "accuracy_plot.png"), bbox_inches='tight', dpi=300)
-        plt.close()
-
 @app.post("/retrain")
 async def retrain(files: List[UploadFile] = File(...),
                  learning_rate: float = 0.0001,
@@ -351,38 +361,54 @@ async def retrain(files: List[UploadFile] = File(...),
     new_data_dir = os.path.join(UPLOAD_DIR, "new_data")
     os.makedirs(new_data_dir, exist_ok=True)
     
+    extracted_dirs = []
+    
     try:
         # 1. Process uploaded files
-        extracted_dirs = []
-        
         for file in files:
+            if not file.filename.lower().endswith('.zip'):
+                raise HTTPException(status_code=400, detail=f"File {file.filename} must be a ZIP file")
+                
             file_path = os.path.join(UPLOAD_DIR, file.filename)
+            logger.info(f"Saving uploaded file to {file_path}")
             with open(file_path, "wb") as buffer:
                 shutil.copyfileobj(file.file, buffer)
             
-            if file.filename.endswith(".zip"):
-                extract_dir = os.path.join(UPLOAD_DIR, f"extract_{os.path.splitext(file.filename)[0]}")
-                os.makedirs(extract_dir, exist_ok=True)
+            extract_dir = os.path.join(UPLOAD_DIR, f"extract_{os.path.splitext(file.filename)[0]}")
+            os.makedirs(extract_dir, exist_ok=True)
+            logger.info(f"Extracting {file_path} to {extract_dir}")
+            try:
                 extract_zip(file_path, extract_dir)
                 extracted_dirs.append(extract_dir)
-                os.remove(file_path)
-                
-                print(f"Extracted ZIP to: {extract_dir}")
-                print(f"Contents of extract_dir: {os.listdir(extract_dir)}")
-                
-                for subdir in ['train', 'val', 'test']:
-                    subdir_path = os.path.join(extract_dir, subdir)
-                    if os.path.exists(subdir_path) and os.path.isdir(subdir_path):
-                        print(f"Processing {subdir}: {os.listdir(subdir_path)}")
-                        for class_name in os.listdir(subdir_path):
-                            class_path = os.path.join(subdir_path, class_name)
-                            if os.path.isdir(class_path) and class_name not in ['__MACOSX']:
-                                target_dir = os.path.join(new_data_dir, class_name)
-                                os.makedirs(target_dir, exist_ok=True)
-                                for img in os.listdir(class_path):
-                                    if img.lower().endswith(('.jpg', '.jpeg', '.png')):
-                                        shutil.copy(os.path.join(class_path, img), os.path.join(target_dir, img))
-        
+            except zipfile.BadZipFile:
+                raise HTTPException(status_code=400, detail=f"Invalid ZIP file: {file.filename}")
+            finally:
+                if os.path.exists(file_path):
+                    os.remove(file_path)
+                    logger.info(f"Removed temporary file {file_path}")
+            
+            # Check if expected subdirs exist
+            found_subdirs = False
+            for subdir in ['train', 'val', 'test']:
+                subdir_path = os.path.join(extract_dir, subdir)
+                if os.path.exists(subdir_path) and os.path.isdir(subdir_path):
+                    found_subdirs = True
+                    logger.info(f"Processing {subdir} in {extract_dir}")
+                    for class_name in os.listdir(subdir_path):
+                        class_path = os.path.join(subdir_path, class_name)
+                        if os.path.isdir(class_path) and class_name not in ['__MACOSX']:
+                            target_dir = os.path.join(new_data_dir, class_name)
+                            os.makedirs(target_dir, exist_ok=True)
+                            for img in os.listdir(class_path):
+                                if img.lower().endswith(('.jpg', '.jpeg', '.png')):
+                                    src = os.path.join(class_path, img)
+                                    dst = os.path.join(target_dir, img)
+                                    shutil.copy(src, dst)
+                                    logger.debug(f"Copied {src} to {dst}")
+            
+            if not found_subdirs:
+                raise HTTPException(status_code=400, detail=f"ZIP file {file.filename} must contain 'train', 'val', or 'test' subdirectories")
+
         # 2. Filter classes with sufficient data
         class_counts = {}
         for class_dir in os.listdir(new_data_dir):
@@ -393,18 +419,16 @@ async def retrain(files: List[UploadFile] = File(...),
                 if image_count >= 2:
                     class_counts[class_dir] = image_count
                 else:
-                    print(f"Skipping class {class_dir} with insufficient samples ({image_count})")
-                    shutil.rmtree(class_path)
+                    shutil.rm-tree(class_path)
+                    logger.info(f"Removed class {class_dir} with insufficient samples ({image_count})")
         
         if not class_counts:
             raise HTTPException(status_code=400, detail={
                 "error": "No valid classes with sufficient data found",
-                "details": "Each class must have at least 2 images",
-                "class_counts": {class_dir: len(os.listdir(os.path.join(new_data_dir, class_dir)))
-                               for class_dir in os.listdir(new_data_dir) if os.path.isdir(os.path.join(new_data_dir, class_dir))}
+                "details": "Each class must have at least 2 images"
             })
         
-        print(f"Valid classes and image counts: {class_counts}")
+        logger.info(f"Valid classes found: {class_counts}")
         
         # 3. Create data generators
         target_names = list(class_counts.keys())
@@ -457,7 +481,8 @@ async def retrain(files: List[UploadFile] = File(...),
             validation_generator = None
         
         # 4. Create a new model for fine-tuning
-        temp_model_path = os.path.join(os.path.dirname(MODEL_PATH), "temp_model.h5")
+        temp_model_path = os.path.join(MODEL_DIR, "temp_model.h5")
+        logger.info(f"Saving temporary model to {temp_model_path}")
         model.save(temp_model_path)
         working_model = tf.keras.models.load_model(temp_model_path)
         
@@ -488,6 +513,7 @@ async def retrain(files: List[UploadFile] = File(...),
         ]
         
         # 6. Train the model
+        logger.info("Starting model training")
         if use_validation:
             history = working_model.fit(
                 train_generator,
@@ -525,15 +551,15 @@ async def retrain(files: List[UploadFile] = File(...),
         )
         
         # 8. Save visualizations with history
-        save_visualizations(y_true, y_pred_classes, target_names, history)
+        timestamp = save_visualizations(y_true, y_pred_classes, target_names, history)
         
-        # 9. Save the fine-tuned model
-        fine_tuned_model_path = os.path.join(os.path.dirname(MODEL_PATH), "plant_disease_model.h5")
-        working_model.save(fine_tuned_model_path)
-        model = tf.keras.models.load_model(fine_tuned_model_path)
+        # 9. Save the fine-tuned model in .h5 format
+        logger.info(f"Saving fine-tuned model to {MODEL_PATH}")
+        working_model.save(MODEL_PATH)
+        model = tf.keras.models.load_model(MODEL_PATH)
         
         CLASS_NAMES = all_classes
-        with open(os.path.join(os.path.dirname(MODEL_PATH), "class_names.json"), "w") as f:
+        with open(os.path.join(MODEL_DIR, "class_names.json"), "w") as f:
             json.dump(CLASS_NAMES, f)
         
         # 10. Prepare metrics and save to database
@@ -562,8 +588,8 @@ async def retrain(files: List[UploadFile] = File(...),
         db.add(retraining)
         db.commit()
         
-        # 11. Prepare response
-        base_url = "https://appdeploy-production.up.railway.app"  # Adjust for production
+        # 11. Prepare response with Railway-compatible URLs
+        base_url = os.getenv("RAILWAY_PUBLIC_DOMAIN", "http://localhost:8000")
         response_content = {
             "message": "Model fine-tuning successful!",
             "num_classes": len(CLASS_NAMES),
@@ -571,12 +597,12 @@ async def retrain(files: List[UploadFile] = File(...),
             "class_counts": class_counts,
             "training_accuracy": training_accuracy,
             "class_metrics": class_metrics,
-            "fine_tuned_model_path": fine_tuned_model_path,
+            "fine_tuned_model_path": MODEL_PATH,
             "visualization_files": {
-                "classification_report": f"{base_url}/visualizations/classification_report.png",
-                "confusion_matrix": f"{base_url}/visualizations/confusion_matrix.png",
-                "loss_plot": f"{base_url}/visualizations/loss_plot.png",
-                "accuracy_plot": f"{base_url}/visualizations/accuracy_plot.png"
+                "classification_report": f"{base_url}/static/visualizations/classification_report_{timestamp}.png",
+                "confusion_matrix": f"{base_url}/static/visualizations/confusion_matrix_{timestamp}.png",
+                "loss_plot": f"{base_url}/static/visualizations/loss_plot_{timestamp}.png",
+                "accuracy_plot": f"{base_url}/static/visualizations/accuracy_plot_{timestamp}.png"
             },
             "retraining_id": retraining.id,
             "user_id": current_user.id
@@ -585,26 +611,42 @@ async def retrain(files: List[UploadFile] = File(...),
         if use_validation:
             response_content["validation_accuracy"] = validation_accuracy
         
+        logger.info("Retraining completed successfully")
         return JSONResponse(content=response_content)
         
     except HTTPException as he:
+        logger.error(f"HTTP Exception: {he.detail}")
         raise he
     except Exception as e:
         import traceback
+        logger.error(f"Unexpected error: {str(e)}\n{traceback.format_exc()}")
         return JSONResponse(content={
             "error": str(e),
             "details": traceback.format_exc()
         }, status_code=500)
     
     finally:
+        # Robust cleanup
         for extract_dir in extracted_dirs:
             if os.path.exists(extract_dir):
-                shutil.rmtree(extract_dir)
+                try:
+                    shutil.rmtree(extract_dir)
+                    logger.info(f"Cleaned up {extract_dir}")
+                except Exception as e:
+                    logger.error(f"Failed to remove {extract_dir}: {e}")
         if os.path.exists(new_data_dir):
-            shutil.rmtree(new_data_dir)
-        temp_model_path = os.path.join(os.path.dirname(MODEL_PATH), "temp_model.h5")
+            try:
+                shutil.rmtree(new_data_dir)
+                logger.info(f"Cleaned up {new_data_dir}")
+            except Exception as e:
+                logger.error(f"Failed to remove {new_data_dir}: {e}")
+        temp_model_path = os.path.join(MODEL_DIR, "temp_model.h5")
         if os.path.exists(temp_model_path):
-            os.remove(temp_model_path)
+            try:
+                os.remove(temp_model_path)
+                logger.info(f"Cleaned up {temp_model_path}")
+            except Exception as e:
+                logger.error(f"Failed to remove {temp_model_path}: {e}")
 
 @app.get("/")
 def read_root():
@@ -626,4 +668,5 @@ async def get_retraining_history(db: Session = Depends(get_db), current_user: Us
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    port = int(os.getenv("PORT", 8000))  # Use Railway's PORT env var
+    uvicorn.run(app, host="0.0.0.0", port=port)
