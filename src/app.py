@@ -15,10 +15,9 @@ from tensorflow.keras.preprocessing import image
 from sklearn.metrics import classification_report, confusion_matrix
 
 from fastapi import FastAPI, UploadFile, File, HTTPException, Depends, status
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
 from jose import JWTError, jwt
 from passlib.context import CryptContext
 from pydantic import BaseModel
@@ -26,17 +25,24 @@ from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, 
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session, relationship
 
+from pymongo import MongoClient
+from gridfs import GridFS
 from dotenv import load_dotenv
 
 # Load environment variables
 load_dotenv()
 
-# Database configuration
-DATABASE_URL = os.getenv("DATABASE_URL")
-DATABASE_URL = DATABASE_URL.replace("mysql://", "mysql+mysqlconnector://", 1)
+# Database configuration (SQL)
+DATABASE_URL = os.getenv("DATABASE_URL").replace("mysql://", "mysql+mysqlconnector://", 1)
 engine = create_engine(DATABASE_URL)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
+
+# MongoDB configuration
+MONGO_URI = os.getenv("MONGO_URI")
+mongo_client = MongoClient(MONGO_URI)
+db = mongo_client["plant_disease_db"]  # Replace with your database name
+fs = GridFS(db)  # GridFS instance for storing files
 
 # JWT Configuration
 SECRET_KEY = os.getenv("SECRET_KEY", "your-secret-key")
@@ -51,7 +57,7 @@ oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
 
 warnings.filterwarnings("ignore", category=UserWarning, module='urllib3')
 
-# Database Models
+# Database Models (SQL)
 class User(Base):
     __tablename__ = "users"
     id = Column(Integer, primary_key=True, index=True)
@@ -85,18 +91,13 @@ Base.metadata.create_all(bind=engine)
 # Define base directory and paths
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 UPLOAD_DIR = os.path.join(BASE_DIR, "Data")
-VISUALIZATION_DIR = os.path.join(BASE_DIR, "visualizations")
 MODEL_PATH = os.path.join(BASE_DIR, "../models/plant_disease_model.h5")
 
 # Create directories upfront
 os.makedirs(UPLOAD_DIR, exist_ok=True)
-os.makedirs(VISUALIZATION_DIR, exist_ok=True)
 
 # Initialize FastAPI app
 app = FastAPI()
-
-# Mount static files after directory creation
-app.mount("/visualizations", StaticFiles(directory=VISUALIZATION_DIR), name="visualizations")
 
 # Add CORS middleware
 app.add_middleware(
@@ -244,10 +245,18 @@ def extract_zip(zip_path, extract_to):
         zip_ref.extractall(extract_to)
 
 def save_visualizations(y_true, y_pred_classes, target_names, history=None):
-    """Save enhanced visualizations including classification report, confusion matrix, and training plots."""
-    # 1. Beautified Classification Report
-    class_report = classification_report(y_true, y_pred_classes, target_names=target_names, output_dict=True)
+    """Save visualizations to MongoDB GridFS and return their IDs."""
+    plot_files = {
+        "classification_report": "classification_report.png",
+        "confusion_matrix": "confusion_matrix.png",
+        "loss_plot": "loss_plot.png",
+        "accuracy_plot": "accuracy_plot.png"
+    }
     
+    visualization_ids = {}
+
+    # 1. Classification Report
+    class_report = classification_report(y_true, y_pred_classes, target_names=target_names, output_dict=True)
     headers = ["Class", "Precision", "Recall", "F1-Score", "Support"]
     rows = []
     for cls in target_names:
@@ -264,20 +273,10 @@ def save_visualizations(y_true, y_pred_classes, target_names, history=None):
 
     fig, ax = plt.subplots(figsize=(12, len(target_names) * 0.6 + 2))
     ax.axis('off')
-    
-    table = ax.table(
-        cellText=rows,
-        colLabels=headers,
-        loc='center',
-        cellLoc='center',
-        colColours=['#4CAF50'] * len(headers),
-        colWidths=[0.4, 0.15, 0.15, 0.15, 0.15],
-    )
-    
+    table = ax.table(cellText=rows, colLabels=headers, loc='center', cellLoc='center', colColours=['#4CAF50'] * 5, colWidths=[0.4, 0.15, 0.15, 0.15, 0.15])
     table.auto_set_font_size(False)
     table.set_fontsize(12)
     table.scale(1.2, 1.5)
-    
     for (row, col), cell in table.get_celld().items():
         if row == 0:
             cell.set_text_props(weight='bold', color='white')
@@ -286,16 +285,14 @@ def save_visualizations(y_true, y_pred_classes, target_names, history=None):
             cell.set_text_props(color='black')
             cell.set_facecolor('#F5F5F5' if row % 2 == 0 else '#FFFFFF')
         cell.set_edgecolor('#D3D3D3')
-    
     plt.title("Classification Report", fontsize=18, weight='bold', pad=20, color='#333333')
-    plt.savefig(
-        os.path.join(VISUALIZATION_DIR, "classification_report.png"),
-        bbox_inches='tight',
-        dpi=300,
-        facecolor='white',
-        edgecolor='none'
-    )
+    
+    buf = io.BytesIO()
+    plt.savefig(buf, format='png', bbox_inches='tight', dpi=300, facecolor='white')
+    buf.seek(0)
+    visualization_ids["classification_report"] = str(fs.put(buf, filename="classification_report.png"))
     plt.close()
+    buf.close()
 
     # 2. Confusion Matrix
     cm = confusion_matrix(y_true, y_pred_classes)
@@ -307,10 +304,15 @@ def save_visualizations(y_true, y_pred_classes, target_names, history=None):
     plt.xticks(rotation=45, ha='right', fontsize=10)
     plt.yticks(rotation=0, fontsize=10)
     plt.tight_layout()
-    plt.savefig(os.path.join(VISUALIZATION_DIR, "confusion_matrix.png"), bbox_inches='tight', dpi=300)
+    
+    buf = io.BytesIO()
+    plt.savefig(buf, format='png', bbox_inches='tight', dpi=300)
+    buf.seek(0)
+    visualization_ids["confusion_matrix"] = str(fs.put(buf, filename="confusion_matrix.png"))
     plt.close()
+    buf.close()
 
-    # 3. Training and Validation Loss
+    # 3. Loss Plot
     if history and 'loss' in history.history:
         plt.figure(figsize=(10, 6))
         plt.plot(history.history['loss'], label='Training Loss', color='blue', linewidth=2)
@@ -322,10 +324,15 @@ def save_visualizations(y_true, y_pred_classes, target_names, history=None):
         plt.legend(fontsize=10)
         plt.grid(True, linestyle='--', alpha=0.7)
         plt.tight_layout()
-        plt.savefig(os.path.join(VISUALIZATION_DIR, "loss_plot.png"), bbox_inches='tight', dpi=300)
+        
+        buf = io.BytesIO()
+        plt.savefig(buf, format='png', bbox_inches='tight', dpi=300)
+        buf.seek(0)
+        visualization_ids["loss_plot"] = str(fs.put(buf, filename="loss_plot.png"))
         plt.close()
+        buf.close()
 
-    # 4. Training and Validation Accuracy
+    # 4. Accuracy Plot
     if history and 'accuracy' in history.history:
         plt.figure(figsize=(10, 6))
         plt.plot(history.history['accuracy'], label='Training Accuracy', color='blue', linewidth=2)
@@ -337,8 +344,15 @@ def save_visualizations(y_true, y_pred_classes, target_names, history=None):
         plt.legend(fontsize=10)
         plt.grid(True, linestyle='--', alpha=0.7)
         plt.tight_layout()
-        plt.savefig(os.path.join(VISUALIZATION_DIR, "accuracy_plot.png"), bbox_inches='tight', dpi=300)
+        
+        buf = io.BytesIO()
+        plt.savefig(buf, format='png', bbox_inches='tight', dpi=300)
+        buf.seek(0)
+        visualization_ids["accuracy_plot"] = str(fs.put(buf, filename="accuracy_plot.png"))
         plt.close()
+        buf.close()
+
+    return visualization_ids
 
 @app.post("/retrain")
 async def retrain(files: List[UploadFile] = File(...),
@@ -354,7 +368,6 @@ async def retrain(files: List[UploadFile] = File(...),
     try:
         # 1. Process uploaded files
         extracted_dirs = []
-        
         for file in files:
             file_path = os.path.join(UPLOAD_DIR, file.filename)
             with open(file_path, "wb") as buffer:
@@ -367,13 +380,9 @@ async def retrain(files: List[UploadFile] = File(...),
                 extracted_dirs.append(extract_dir)
                 os.remove(file_path)
                 
-                print(f"Extracted ZIP to: {extract_dir}")
-                print(f"Contents of extract_dir: {os.listdir(extract_dir)}")
-                
                 for subdir in ['train', 'val', 'test']:
                     subdir_path = os.path.join(extract_dir, subdir)
                     if os.path.exists(subdir_path) and os.path.isdir(subdir_path):
-                        print(f"Processing {subdir}: {os.listdir(subdir_path)}")
                         for class_name in os.listdir(subdir_path):
                             class_path = os.path.join(subdir_path, class_name)
                             if os.path.isdir(class_path) and class_name not in ['__MACOSX']:
@@ -393,18 +402,13 @@ async def retrain(files: List[UploadFile] = File(...),
                 if image_count >= 2:
                     class_counts[class_dir] = image_count
                 else:
-                    print(f"Skipping class {class_dir} with insufficient samples ({image_count})")
                     shutil.rmtree(class_path)
         
         if not class_counts:
             raise HTTPException(status_code=400, detail={
                 "error": "No valid classes with sufficient data found",
-                "details": "Each class must have at least 2 images",
-                "class_counts": {class_dir: len(os.listdir(os.path.join(new_data_dir, class_dir)))
-                               for class_dir in os.listdir(new_data_dir) if os.path.isdir(os.path.join(new_data_dir, class_dir))}
+                "details": "Each class must have at least 2 images"
             })
-        
-        print(f"Valid classes and image counts: {class_counts}")
         
         # 3. Create data generators
         target_names = list(class_counts.keys())
@@ -524,8 +528,8 @@ async def retrain(files: List[UploadFile] = File(...),
             output_dict=True
         )
         
-        # 8. Save visualizations with history
-        save_visualizations(y_true, y_pred_classes, target_names, history)
+        # 8. Save visualizations to MongoDB
+        visualization_ids = save_visualizations(y_true, y_pred_classes, target_names, history)
         
         # 9. Save the fine-tuned model
         fine_tuned_model_path = os.path.join(os.path.dirname(MODEL_PATH), "plant_disease_model.h5")
@@ -562,8 +566,15 @@ async def retrain(files: List[UploadFile] = File(...),
         db.add(retraining)
         db.commit()
         
-        # 11. Prepare response
-        base_url = "https://appdeploy-production.up.railway.app"  # Adjust for production
+        # 11. Prepare response with visualization URLs
+        base_url = os.getenv("BASE_URL", "https://appdeploy-production.up.railway.app")
+        visualization_files = {
+            "classification_report": f"{base_url}/visualizations/{visualization_ids.get('classification_report', '')}",
+            "confusion_matrix": f"{base_url}/visualizations/{visualization_ids.get('confusion_matrix', '')}",
+            "loss_plot": f"{base_url}/visualizations/{visualization_ids.get('loss_plot', '')}",
+            "accuracy_plot": f"{base_url}/visualizations/{visualization_ids.get('accuracy_plot', '')}"
+        }
+
         response_content = {
             "message": "Model fine-tuning successful!",
             "num_classes": len(CLASS_NAMES),
@@ -572,12 +583,7 @@ async def retrain(files: List[UploadFile] = File(...),
             "training_accuracy": training_accuracy,
             "class_metrics": class_metrics,
             "fine_tuned_model_path": fine_tuned_model_path,
-            "visualization_files": {
-                "classification_report": f"{base_url}/visualizations/classification_report.png",
-                "confusion_matrix": f"{base_url}/visualizations/confusion_matrix.png",
-                "loss_plot": f"{base_url}/visualizations/loss_plot.png",
-                "accuracy_plot": f"{base_url}/visualizations/accuracy_plot.png"
-            },
+            "visualization_files": visualization_files,
             "retraining_id": retraining.id,
             "user_id": current_user.id
         }
@@ -605,6 +611,14 @@ async def retrain(files: List[UploadFile] = File(...),
         temp_model_path = os.path.join(os.path.dirname(MODEL_PATH), "temp_model.h5")
         if os.path.exists(temp_model_path):
             os.remove(temp_model_path)
+
+@app.get("/visualizations/{file_id}")
+async def get_visualization(file_id: str):
+    try:
+        grid_out = fs.get(file_id)
+        return StreamingResponse(grid_out, media_type="image/png")
+    except Exception as e:
+        raise HTTPException(status_code=404, detail=f"Visualization not found: {str(e)}")
 
 @app.get("/")
 def read_root():
