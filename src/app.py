@@ -4,8 +4,8 @@ import zipfile
 import io
 import json
 import warnings
-from datetime import datetime
-from typing import List, Any
+from datetime import datetime, timedelta
+from typing import List
 
 import numpy as np
 import tensorflow as tf
@@ -31,6 +31,7 @@ from dotenv import load_dotenv
 # Load environment variables
 load_dotenv()
 
+# Database configuration
 DATABASE_URL = os.getenv("DATABASE_URL")
 DATABASE_URL = DATABASE_URL.replace("mysql://", "mysql+mysqlconnector://", 1)
 engine = create_engine(DATABASE_URL)
@@ -81,11 +82,21 @@ class Retraining(Base):
 
 Base.metadata.create_all(bind=engine)
 
+# Define base directory and paths
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+UPLOAD_DIR = os.path.join(BASE_DIR, "Data")
+VISUALIZATION_DIR = os.path.join(BASE_DIR, "visualizations")
+MODEL_PATH = os.path.join(BASE_DIR, "../models/plant_disease_model.h5")
+
+# Create directories upfront
+os.makedirs(UPLOAD_DIR, exist_ok=True)
+os.makedirs(VISUALIZATION_DIR, exist_ok=True)
+
 # Initialize FastAPI app
 app = FastAPI()
 
-# Serve static files from the "visualizations" directory
-app.mount("/visualizations", StaticFiles(directory="visualizations"), name="visualizations")
+# Mount static files after directory creation
+app.mount("/visualizations", StaticFiles(directory=VISUALIZATION_DIR), name="visualizations")
 
 # Add CORS middleware
 app.add_middleware(
@@ -96,9 +107,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Ensure MODEL_PATH is an absolute path
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-MODEL_PATH = os.path.join(BASE_DIR, "../models/plant_disease_model.h5")
+# Load model
 print(f"Model path: {MODEL_PATH}")
 print(f"Does the model file exist? {os.path.exists(MODEL_PATH)}")
 if not os.path.exists(MODEL_PATH):
@@ -121,11 +130,6 @@ CLASS_NAMES = [
     'Tomato___Tomato_mosaic_virus', 'Tomato___healthy'
 ]
 
-UPLOAD_DIR = "Data"
-VISUALIZATION_DIR = "visualizations"
-os.makedirs(UPLOAD_DIR, exist_ok=True)
-os.makedirs(VISUALIZATION_DIR, exist_ok=True)
-
 # Pydantic models for request/response
 class UserCreate(BaseModel):
     username: str
@@ -143,7 +147,6 @@ def get_password_hash(password):
     return pwd_context.hash(password)
 
 def create_access_token(data: dict):
-    from datetime import timedelta
     to_encode = data.copy()
     expire = datetime.utcnow() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
     to_encode.update({"exp": expire})
@@ -245,7 +248,6 @@ def save_visualizations(y_true, y_pred_classes, target_names, history=None):
     # 1. Beautified Classification Report
     class_report = classification_report(y_true, y_pred_classes, target_names=target_names, output_dict=True)
     
-    # Prepare data for the table
     headers = ["Class", "Precision", "Recall", "F1-Score", "Support"]
     rows = []
     for cls in target_names:
@@ -257,42 +259,35 @@ def save_visualizations(y_true, y_pred_classes, target_names, history=None):
                 f"{class_report[cls]['f1-score']:.2f}",
                 f"{class_report[cls]['support']}"
             ])
-    # Add accuracy row
     total_support = sum(class_report[cls]['support'] for cls in target_names if cls in class_report)
     rows.append(["Accuracy", "", "", f"{class_report['accuracy']:.2f}", f"{total_support}"])
 
-    # Create the figure
-    fig, ax = plt.subplots(figsize=(12, len(target_names) * 0.6 + 2))  # Adjust height based on number of classes
+    fig, ax = plt.subplots(figsize=(12, len(target_names) * 0.6 + 2))
     ax.axis('off')
     
-    # Create a table
     table = ax.table(
         cellText=rows,
         colLabels=headers,
         loc='center',
         cellLoc='center',
-        colColours=['#4CAF50'] * len(headers),  # Green header background
-        colWidths=[0.4, 0.15, 0.15, 0.15, 0.15],  # Adjust column widths
+        colColours=['#4CAF50'] * len(headers),
+        colWidths=[0.4, 0.15, 0.15, 0.15, 0.15],
     )
     
-    # Style the table
     table.auto_set_font_size(False)
     table.set_fontsize(12)
-    table.scale(1.2, 1.5)  # Scale table for better readability
+    table.scale(1.2, 1.5)
     
     for (row, col), cell in table.get_celld().items():
-        if row == 0:  # Header row
+        if row == 0:
             cell.set_text_props(weight='bold', color='white')
-            cell.set_facecolor('#4CAF50')  # Green background for headers
-        else:  # Data rows
+            cell.set_facecolor('#4CAF50')
+        else:
             cell.set_text_props(color='black')
-            cell.set_facecolor('#F5F5F5' if row % 2 == 0 else '#FFFFFF')  # Alternating row colors
-        cell.set_edgecolor('#D3D3D3')  # Light gray borders
+            cell.set_facecolor('#F5F5F5' if row % 2 == 0 else '#FFFFFF')
+        cell.set_edgecolor('#D3D3D3')
     
-    # Add title
     plt.title("Classification Report", fontsize=18, weight='bold', pad=20, color='#333333')
-    
-    # Save the figure
     plt.savefig(
         os.path.join(VISUALIZATION_DIR, "classification_report.png"),
         bbox_inches='tight',
@@ -302,7 +297,7 @@ def save_visualizations(y_true, y_pred_classes, target_names, history=None):
     )
     plt.close()
 
-    # 2. Confusion Matrix (unchanged from your original)
+    # 2. Confusion Matrix
     cm = confusion_matrix(y_true, y_pred_classes)
     plt.figure(figsize=(max(10, len(target_names)), max(10, len(target_names))))
     sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', xticklabels=target_names, yticklabels=target_names, cbar=True)
@@ -315,7 +310,7 @@ def save_visualizations(y_true, y_pred_classes, target_names, history=None):
     plt.savefig(os.path.join(VISUALIZATION_DIR, "confusion_matrix.png"), bbox_inches='tight', dpi=300)
     plt.close()
 
-    # 3. Training and Validation Loss (unchanged)
+    # 3. Training and Validation Loss
     if history and 'loss' in history.history:
         plt.figure(figsize=(10, 6))
         plt.plot(history.history['loss'], label='Training Loss', color='blue', linewidth=2)
@@ -330,7 +325,7 @@ def save_visualizations(y_true, y_pred_classes, target_names, history=None):
         plt.savefig(os.path.join(VISUALIZATION_DIR, "loss_plot.png"), bbox_inches='tight', dpi=300)
         plt.close()
 
-    # 4. Training and Validation Accuracy (unchanged)
+    # 4. Training and Validation Accuracy
     if history and 'accuracy' in history.history:
         plt.figure(figsize=(10, 6))
         plt.plot(history.history['accuracy'], label='Training Accuracy', color='blue', linewidth=2)
@@ -375,7 +370,6 @@ async def retrain(files: List[UploadFile] = File(...),
                 print(f"Extracted ZIP to: {extract_dir}")
                 print(f"Contents of extract_dir: {os.listdir(extract_dir)}")
                 
-                # Process train and val subdirectories
                 for subdir in ['train', 'val', 'test']:
                     subdir_path = os.path.join(extract_dir, subdir)
                     if os.path.exists(subdir_path) and os.path.isdir(subdir_path):
@@ -396,7 +390,7 @@ async def retrain(files: List[UploadFile] = File(...),
             if os.path.isdir(class_path):
                 image_count = len([f for f in os.listdir(class_path)
                                  if f.lower().endswith(('.png', '.jpg', '.jpeg'))])
-                if image_count >= 2:  # Minimum 2 images per class
+                if image_count >= 2:
                     class_counts[class_dir] = image_count
                 else:
                     print(f"Skipping class {class_dir} with insufficient samples ({image_count})")
@@ -415,7 +409,7 @@ async def retrain(files: List[UploadFile] = File(...),
         # 3. Create data generators
         target_names = list(class_counts.keys())
         all_classes = list(set(CLASS_NAMES + target_names))
-        use_validation = all(count >= 4 for count in class_counts.values())  # Require 4+ for validation split
+        use_validation = all(count >= 4 for count in class_counts.values())
         
         if use_validation:
             data_generator = tf.keras.preprocessing.image.ImageDataGenerator(
@@ -629,3 +623,7 @@ async def get_retraining_history(db: Session = Depends(get_db), current_user: Us
              "validation_accuracy": r.validation_accuracy, "class_metrics": json.loads(r.class_metrics),
              "date": r.timestamp.isoformat()}
             for r in retrainings]
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
