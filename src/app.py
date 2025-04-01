@@ -33,7 +33,7 @@ from dotenv import load_dotenv
 # Load environment variables
 load_dotenv()
 
-# Database configuration (SQLAlchemy for users/predictions, MongoDB for visualizations)
+# Database configuration
 DATABASE_URL = os.getenv("DATABASE_URL")
 DATABASE_URL = DATABASE_URL.replace("mysql://", "mysql+mysqlconnector://", 1)
 engine = create_engine(DATABASE_URL)
@@ -186,9 +186,9 @@ async def get_current_user(token: str = Depends(oauth2_scheme), db: Session = De
     
     return user
 
-def preprocess_image(img_bytes: bytes):
+def preprocess_image(img_path: str):
     """Preprocess image for prediction."""
-    img = image.load_img(io.BytesIO(img_bytes), target_size=(128, 128))
+    img = image.load_img(img_path, target_size=(128, 128))
     img_array = image.img_to_array(img) / 255.0
     img_array = np.expand_dims(img_array, axis=0)
     return img_array
@@ -225,8 +225,10 @@ async def predict(file: UploadFile = File(...),
                  db: Session = Depends(get_db),
                  current_user: User = Depends(get_current_user)):
     img_bytes = await file.read()
-    img = preprocess_image(img_bytes)
-    predictions = model.predict(img)
+    img = image.load_img(io.BytesIO(img_bytes), target_size=(128, 128))
+    img_array = image.img_to_array(img) / 255.0
+    img_array = np.expand_dims(img_array, axis=0)
+    predictions = model.predict(img_array)
     predicted_index = np.argmax(predictions, axis=1)[0]
     confidence = np.max(predictions)
     disease = CLASS_NAMES[predicted_index]
@@ -246,12 +248,12 @@ def extract_zip(zip_path, extract_to):
     with zipfile.ZipFile(zip_path, 'r') as zip_ref:
         zip_ref.extractall(extract_to)
 
-def save_visualizations_to_mongo(y_true, y_pred_classes, target_names, history=None):
+def save_visualizations_to_mongo(y_true, y_pred_classes, target_names, class_indices, history=None):
     """Save visualizations to MongoDB and return their IDs."""
     viz_ids = {}
 
     # 1. Classification Report
-    class_report = classification_report(y_true, y_pred_classes, target_names=target_names, output_dict=True)
+    class_report = classification_report(y_true, y_pred_classes, target_names=target_names, labels=class_indices, output_dict=True, zero_division=0)
     headers = ["Class", "Precision", "Recall", "F1-Score", "Support"]
     rows = []
     for cls in target_names:
@@ -264,7 +266,10 @@ def save_visualizations_to_mongo(y_true, y_pred_classes, target_names, history=N
                 f"{class_report[cls]['support']}"
             ])
     total_support = sum(class_report[cls]['support'] for cls in target_names if cls in class_report)
-    rows.append(["Accuracy", "", "", f"{class_report['accuracy']:.2f}", f"{total_support}"])
+    # Calculate accuracy manually for the subset
+    correct = sum(1 for true, pred in zip(y_true, y_pred_classes) if true == pred and true in class_indices)
+    accuracy = correct / total_support if total_support > 0 else 0.0
+    rows.append(["Accuracy", "", "", f"{accuracy:.2f}", f"{total_support}"])
 
     fig, ax = plt.subplots(figsize=(12, len(target_names) * 0.6 + 2))
     ax.axis('off')
@@ -290,7 +295,7 @@ def save_visualizations_to_mongo(y_true, y_pred_classes, target_names, history=N
     buf.close()
 
     # 2. Confusion Matrix
-    cm = confusion_matrix(y_true, y_pred_classes)
+    cm = confusion_matrix(y_true, y_pred_classes, labels=class_indices)
     plt.figure(figsize=(max(10, len(target_names)), max(10, len(target_names))))
     sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', xticklabels=target_names, yticklabels=target_names, cbar=True)
     plt.title("Confusion Matrix", fontsize=16, pad=20)
@@ -360,7 +365,6 @@ async def retrain(files: List[UploadFile] = File(...),
     try:
         # 1. Process uploaded files
         extracted_dirs = []
-        
         for file in files:
             file_path = os.path.join(UPLOAD_DIR, file.filename)
             with open(file_path, "wb") as buffer:
@@ -372,30 +376,41 @@ async def retrain(files: List[UploadFile] = File(...),
                 extract_zip(file_path, extract_dir)
                 extracted_dirs.append(extract_dir)
                 os.remove(file_path)
-                
-                for subdir in ['train', 'val', 'test']:
-                    subdir_path = os.path.join(extract_dir, subdir)
-                    if os.path.exists(subdir_path) and os.path.isdir(subdir_path):
-                        for class_name in os.listdir(subdir_path):
-                            class_path = os.path.join(subdir_path, class_name)
-                            if os.path.isdir(class_path) and class_name not in ['__MACOSX']:
-                                target_dir = os.path.join(new_data_dir, class_name)
-                                os.makedirs(target_dir, exist_ok=True)
-                                for img in os.listdir(class_path):
-                                    if img.lower().endswith(('.jpg', '.jpeg', '.png')):
-                                        shutil.copy(os.path.join(class_path, img), os.path.join(target_dir, img))
         
-        # 2. Filter classes with sufficient data
+        # 2. Organize data and classify images
         class_counts = {}
-        for class_dir in os.listdir(new_data_dir):
-            class_path = os.path.join(new_data_dir, class_dir)
-            if os.path.isdir(class_path):
-                image_count = len([f for f in os.listdir(class_path)
-                                 if f.lower().endswith(('.png', '.jpg', '.jpeg'))])
-                if image_count >= 2:
-                    class_counts[class_dir] = image_count
-                else:
-                    shutil.rmtree(class_path)
+        initial_predictions = {"train": {}, "val": {}}
+        
+        for subdir in ['train', 'val']:
+            subdir_path = os.path.join(extract_dir, subdir)
+            if os.path.exists(subdir_path) and os.path.isdir(subdir_path):
+                for class_name in os.listdir(subdir_path):
+                    class_path = os.path.join(subdir_path, class_name)
+                    if os.path.isdir(class_path) and class_name in CLASS_NAMES and class_name not in ['__MACOSX']:
+                        target_dir = os.path.join(new_data_dir, subdir, class_name)
+                        os.makedirs(target_dir, exist_ok=True)
+                        image_count = 0
+                        initial_predictions[subdir][class_name] = []
+                        for img in os.listdir(class_path):
+                            if img.lower().endswith(('.jpg', '.jpeg', '.png')):
+                                img_path = os.path.join(class_path, img)
+                                shutil.copy(img_path, os.path.join(target_dir, img))
+                                image_count += 1
+                                # Classify with pre-trained model
+                                img_array = preprocess_image(img_path)
+                                pred = model.predict(img_array)
+                                pred_index = np.argmax(pred, axis=1)[0]
+                                pred_confidence = float(np.max(pred))
+                                initial_predictions[subdir][class_name].append({
+                                    "image": img,
+                                    "predicted_class": CLASS_NAMES[pred_index],
+                                    "confidence": pred_confidence,
+                                    "correct": CLASS_NAMES[pred_index] == class_name
+                                })
+                        if image_count >= 2:  # Minimum 2 images per class
+                            class_counts[class_name] = class_counts.get(class_name, 0) + image_count
+                        else:
+                            shutil.rmtree(target_dir)
         
         if not class_counts:
             raise HTTPException(status_code=400, detail={
@@ -403,57 +418,40 @@ async def retrain(files: List[UploadFile] = File(...),
                 "details": "Each class must have at least 2 images"
             })
         
-        # 3. Create data generators
-        target_names = list(class_counts.keys())
-        all_classes = list(set(CLASS_NAMES + target_names))
-        use_validation = all(count >= 4 for count in class_counts.values())
+        target_names = list(class_counts.keys())  # Subset of classes in ZIP file
+        class_indices = [CLASS_NAMES.index(cls) for cls in target_names]  # Indices in full CLASS_NAMES
         
-        if use_validation:
-            data_generator = tf.keras.preprocessing.image.ImageDataGenerator(
-                rescale=1./255,
-                validation_split=0.2,
-                rotation_range=15,
-                width_shift_range=0.1,
-                height_shift_range=0.1,
-                zoom_range=0.1
-            )
-            train_generator = data_generator.flow_from_directory(
-                new_data_dir,
-                target_size=(128, 128),
-                batch_size=32,
-                class_mode='categorical',
-                classes=all_classes,
-                subset='training',
-                shuffle=True
-            )
-            validation_generator = data_generator.flow_from_directory(
-                new_data_dir,
-                target_size=(128, 128),
-                batch_size=32,
-                class_mode='categorical',
-                classes=all_classes,
-                subset='validation',
-                shuffle=False
-            )
-        else:
-            data_generator = tf.keras.preprocessing.image.ImageDataGenerator(
-                rescale=1./255,
-                rotation_range=15,
-                width_shift_range=0.1,
-                height_shift_range=0.1,
-                zoom_range=0.1
-            )
-            train_generator = data_generator.flow_from_directory(
-                new_data_dir,
-                target_size=(128, 128),
-                batch_size=32,
-                class_mode='categorical',
-                classes=all_classes,
-                shuffle=True
-            )
-            validation_generator = None
+        # 3. Create data generators with full class list
+        train_dir = os.path.join(new_data_dir, "train")
+        val_dir = os.path.join(new_data_dir, "val")
         
-        # 4. Create a new model for fine-tuning
+        train_generator = tf.keras.preprocessing.image.ImageDataGenerator(
+            rescale=1./255,
+            rotation_range=15,
+            width_shift_range=0.1,
+            height_shift_range=0.1,
+            zoom_range=0.1
+        ).flow_from_directory(
+            train_dir,
+            target_size=(128, 128),
+            batch_size=32,
+            class_mode='categorical',
+            classes=CLASS_NAMES,  # Full 38 classes
+            shuffle=True
+        )
+        
+        validation_generator = tf.keras.preprocessing.image.ImageDataGenerator(
+            rescale=1./255
+        ).flow_from_directory(
+            val_dir,
+            target_size=(128, 128),
+            batch_size=32,
+            class_mode='categorical',
+            classes=CLASS_NAMES,  # Full 38 classes
+            shuffle=False
+        )
+        
+        # 4. Fine-tune the model
         temp_model_path = os.path.join(os.path.dirname(MODEL_PATH), "temp_model.h5")
         model.save(temp_model_path)
         working_model = tf.keras.models.load_model(temp_model_path)
@@ -469,85 +467,57 @@ async def retrain(files: List[UploadFile] = File(...),
             metrics=['accuracy']
         )
         
-        # 5. Add callbacks
         callbacks = [
-            tf.keras.callbacks.EarlyStopping(
-                monitor='val_loss' if use_validation else 'loss',
-                patience=3,
-                restore_best_weights=True
-            ),
-            tf.keras.callbacks.ReduceLROnPlateau(
-                monitor='val_loss' if use_validation else 'loss',
-                factor=0.5,
-                patience=2,
-                min_lr=1e-7
-            )
+            tf.keras.callbacks.EarlyStopping(monitor='val_loss', patience=3, restore_best_weights=True),
+            tf.keras.callbacks.ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=2, min_lr=1e-7)
         ]
         
-        # 6. Train the model
-        if use_validation:
-            history = working_model.fit(
-                train_generator,
-                validation_data=validation_generator,
-                epochs=epochs,
-                callbacks=callbacks,
-                steps_per_epoch=max(1, len(train_generator)),
-                validation_steps=max(1, len(validation_generator))
-            )
-        else:
-            history = working_model.fit(
-                train_generator,
-                epochs=epochs,
-                callbacks=callbacks,
-                steps_per_epoch=max(1, len(train_generator))
-            )
+        history = working_model.fit(
+            train_generator,
+            validation_data=validation_generator,
+            epochs=epochs,
+            callbacks=callbacks,
+            steps_per_epoch=max(1, len(train_generator)),
+            validation_steps=max(1, len(validation_generator))
+        )
         
-        # 7. Generate classification report and predictions
-        if use_validation:
-            validation_generator.reset()
-            y_pred = working_model.predict(validation_generator)
-            y_pred_classes = np.argmax(y_pred, axis=1)
-            y_true = validation_generator.classes
-        else:
-            train_generator.reset()
-            y_pred = working_model.predict(train_generator)
-            y_pred_classes = np.argmax(y_pred, axis=1)
-            y_true = train_generator.classes
+        # 5. Evaluate on validation set
+        validation_generator.reset()
+        y_pred = working_model.predict(validation_generator)
+        y_pred_classes = np.argmax(y_pred, axis=1)
+        y_true = validation_generator.classes
         
+        # Filter to subset classes for reporting, handle undefined metrics
         class_report = classification_report(
             y_true,
             y_pred_classes,
             target_names=target_names,
-            output_dict=True
+            labels=class_indices,
+            output_dict=True,
+            zero_division=0  # Suppress precision warnings
         )
         
-        # 8. Save visualizations to MongoDB
-        viz_ids = save_visualizations_to_mongo(y_true, y_pred_classes, target_names, history)
+        # 6. Save visualizations
+        viz_ids = save_visualizations_to_mongo(y_true, y_pred_classes, target_names, class_indices, history)
         
-        # 9. Save the fine-tuned model
+        # 7. Save the fine-tuned model
         fine_tuned_model_path = os.path.join(os.path.dirname(MODEL_PATH), "plant_disease_model.h5")
         working_model.save(fine_tuned_model_path)
         model = tf.keras.models.load_model(fine_tuned_model_path)
         
-        CLASS_NAMES = all_classes
-        with open(os.path.join(os.path.dirname(MODEL_PATH), "class_names.json"), "w") as f:
-            json.dump(CLASS_NAMES, f)
-        
-        # 10. Prepare metrics and save to database
+        # 8. Prepare metrics and save to database
         class_metrics = {}
         for class_name in target_names:
-            if class_name in class_report:
+            if class_name in class_report:  # Check if class exists in report
                 class_metrics[class_name] = {
-                    "precision": float(class_report[class_name]['precision']),
-                    "recall": float(class_report[class_name]['recall']),
-                    "f1_score": float(class_report[class_name]['f1-score']),
-                    "support": int(class_report[class_name]['support'])
+                    "precision": float(class_report[class_name].get('precision', 0.0)),
+                    "recall": float(class_report[class_name].get('recall', 0.0)),
+                    "f1_score": float(class_report[class_name].get('f1-score', 0.0)),
+                    "support": int(class_report[class_name].get('support', 0))
                 }
         
-        new_classes_added = [cls for cls in target_names if cls not in CLASS_NAMES]
-        
-        training_accuracy = float(history.history['accuracy'][-1]) if 'accuracy' in history.history else None
-        validation_accuracy = float(history.history['val_accuracy'][-1]) if use_validation and 'val_accuracy' in history.history else None
+        training_accuracy = float(history.history['accuracy'][-1])
+        validation_accuracy = float(history.history['val_accuracy'][-1])
         
         retraining = Retraining(
             user_id=current_user.id,
@@ -559,7 +529,7 @@ async def retrain(files: List[UploadFile] = File(...),
         db.add(retraining)
         db.commit()
         
-        # 11. Prepare response with visualization IDs
+        # 9. Prepare response
         base_url = os.getenv("BASE_URL", "")
         visualization_files = {
             "classification_report": f"{base_url}/visualization/{viz_ids.get('classification_report')}",
@@ -571,9 +541,11 @@ async def retrain(files: List[UploadFile] = File(...),
         response_content = {
             "message": "Model fine-tuning successful!",
             "num_classes": len(CLASS_NAMES),
-            "new_classes_added": new_classes_added,
+            "classes_in_zip": target_names,
             "class_counts": class_counts,
+            "initial_predictions": initial_predictions,
             "training_accuracy": training_accuracy,
+            "validation_accuracy": validation_accuracy,
             "class_metrics": class_metrics,
             "fine_tuned_model_path": fine_tuned_model_path,
             "visualization_files": visualization_files,
@@ -581,15 +553,14 @@ async def retrain(files: List[UploadFile] = File(...),
             "user_id": current_user.id
         }
         
-        if use_validation:
-            response_content["validation_accuracy"] = validation_accuracy
-        
         return JSONResponse(content=response_content)
         
     except HTTPException as he:
         raise he
     except Exception as e:
         import traceback
+        print(f"Error during retraining: {str(e)}")  # Log to console
+        print(traceback.format_exc())  # Full stack trace
         return JSONResponse(content={
             "error": str(e),
             "details": traceback.format_exc()
@@ -601,7 +572,6 @@ async def retrain(files: List[UploadFile] = File(...),
                 shutil.rmtree(extract_dir)
         if os.path.exists(new_data_dir):
             shutil.rmtree(new_data_dir)
-        temp_model_path = os.path.join(os.path.dirname(MODEL_PATH), "temp_model.h5")
         if os.path.exists(temp_model_path):
             os.remove(temp_model_path)
 
