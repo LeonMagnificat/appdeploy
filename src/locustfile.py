@@ -12,7 +12,7 @@ SAMPLE_ZIP_PATH = "/Users/samenergy/Documents/Projects/PlantDiseaseDetection/Arc
 
 class PlantDiseaseUser(HttpUser):
     wait_time = between(1, 5)  # Simulate users waiting 1-5 seconds between tasks
-    host = " http://127.0.0.1:8000 "  # The host where your FastAPI app is running
+    host = " https://appdeploy-production.up.railway.app/ "  # The host where your FastAPI app is running
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
