@@ -4,9 +4,9 @@ import zipfile
 import io
 import json
 import warnings
+import asyncio
 from datetime import datetime, timedelta
 from typing import List
-import base64
 from bson import ObjectId
 
 import numpy as np
@@ -17,7 +17,7 @@ from tensorflow.keras.preprocessing import image
 from sklearn.metrics import classification_report, confusion_matrix
 from pymongo import MongoClient
 
-from fastapi import FastAPI, UploadFile, File, HTTPException, Depends, status
+from fastapi import FastAPI, UploadFile, File, HTTPException, Depends, status, WebSocket
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.security import OAuth2PasswordBearer, OAuth2PasswordRequestForm
 from fastapi.middleware.cors import CORSMiddleware
@@ -93,7 +93,7 @@ Base.metadata.create_all(bind=engine)
 # Define base directory and paths
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 UPLOAD_DIR = os.path.join(BASE_DIR, "Data")
-MODEL_PATH = os.path.join(BASE_DIR, "../models/plant_disease_model.h5")
+MODEL_PATH = os.path.join(BASE_DIR, "../models/plant_disease_model.h5")  # Updated to .keras format
 
 # Create directories upfront
 os.makedirs(UPLOAD_DIR, exist_ok=True)
@@ -141,6 +141,32 @@ class UserCreate(BaseModel):
 class Token(BaseModel):
     access_token: str
     token_type: str
+
+# WebSocket manager
+class WebSocketManager:
+    def __init__(self):
+        self.active_connections: List[WebSocket] = []
+
+    async def connect(self, websocket: WebSocket):
+        await websocket.accept()
+        self.active_connections.append(websocket)
+
+    def disconnect(self, websocket: WebSocket):
+        if websocket in self.active_connections:
+            self.active_connections.remove(websocket)
+
+    async def broadcast(self, message: str):
+        disconnected = []
+        for connection in self.active_connections:
+            try:
+                await connection.send_text(message)
+            except Exception as e:
+                print(f"Error broadcasting to WebSocket: {e}")
+                disconnected.append(connection)
+        for conn in disconnected:
+            self.disconnect(conn)
+
+ws_manager = WebSocketManager()
 
 # Utility functions
 def verify_password(plain_password, hashed_password):
@@ -219,6 +245,17 @@ async def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = 
     access_token = create_access_token(data={"sub": user.username})
     return {"access_token": access_token, "token_type": "bearer"}
 
+# WebSocket endpoint
+@app.websocket("/ws/retrain-progress")
+async def websocket_endpoint(websocket: WebSocket):
+    await ws_manager.connect(websocket)
+    try:
+        while True:
+            await websocket.receive_text()  # Keep connection alive
+    except Exception as e:
+        print(f"WebSocket disconnected: {e}")
+        ws_manager.disconnect(websocket)
+
 # Protected endpoints
 @app.post("/predict")
 async def predict(file: UploadFile = File(...),
@@ -266,7 +303,6 @@ def save_visualizations_to_mongo(y_true, y_pred_classes, target_names, class_ind
                 f"{class_report[cls]['support']}"
             ])
     total_support = sum(class_report[cls]['support'] for cls in target_names if cls in class_report)
-    # Calculate accuracy manually for the subset
     correct = sum(1 for true, pred in zip(y_true, y_pred_classes) if true == pred and true in class_indices)
     accuracy = correct / total_support if total_support > 0 else 0.0
     rows.append(["Accuracy", "", "", f"{accuracy:.2f}", f"{total_support}"])
@@ -377,6 +413,8 @@ async def retrain(files: List[UploadFile] = File(...),
                 extracted_dirs.append(extract_dir)
                 os.remove(file_path)
         
+        await ws_manager.broadcast(json.dumps({"progress": 10}))  # Step 1 complete
+
         # 2. Organize data and classify images
         class_counts = {}
         initial_predictions = {"train": {}, "val": {}}
@@ -396,7 +434,6 @@ async def retrain(files: List[UploadFile] = File(...),
                                 img_path = os.path.join(class_path, img)
                                 shutil.copy(img_path, os.path.join(target_dir, img))
                                 image_count += 1
-                                # Classify with pre-trained model
                                 img_array = preprocess_image(img_path)
                                 pred = model.predict(img_array)
                                 pred_index = np.argmax(pred, axis=1)[0]
@@ -407,7 +444,7 @@ async def retrain(files: List[UploadFile] = File(...),
                                     "confidence": pred_confidence,
                                     "correct": CLASS_NAMES[pred_index] == class_name
                                 })
-                        if image_count >= 2:  # Minimum 2 images per class
+                        if image_count >= 2:
                             class_counts[class_name] = class_counts.get(class_name, 0) + image_count
                         else:
                             shutil.rmtree(target_dir)
@@ -418,10 +455,12 @@ async def retrain(files: List[UploadFile] = File(...),
                 "details": "Each class must have at least 2 images"
             })
         
-        target_names = list(class_counts.keys())  # Subset of classes in ZIP file
-        class_indices = [CLASS_NAMES.index(cls) for cls in target_names]  # Indices in full CLASS_NAMES
+        target_names = list(class_counts.keys())
+        class_indices = [CLASS_NAMES.index(cls) for cls in target_names]
         
-        # 3. Create data generators with full class list
+        await ws_manager.broadcast(json.dumps({"progress": 30}))  # Step 2 complete
+
+        # 3. Create data generators
         train_dir = os.path.join(new_data_dir, "train")
         val_dir = os.path.join(new_data_dir, "val")
         
@@ -436,7 +475,7 @@ async def retrain(files: List[UploadFile] = File(...),
             target_size=(128, 128),
             batch_size=32,
             class_mode='categorical',
-            classes=CLASS_NAMES,  # Full 38 classes
+            classes=CLASS_NAMES,
             shuffle=True
         )
         
@@ -447,10 +486,12 @@ async def retrain(files: List[UploadFile] = File(...),
             target_size=(128, 128),
             batch_size=32,
             class_mode='categorical',
-            classes=CLASS_NAMES,  # Full 38 classes
+            classes=CLASS_NAMES,
             shuffle=False
         )
         
+        await ws_manager.broadcast(json.dumps({"progress": 40}))  # Step 3 complete
+
         # 4. Fine-tune the model
         temp_model_path = os.path.join(os.path.dirname(MODEL_PATH), "temp_model.h5")
         model.save(temp_model_path)
@@ -462,14 +503,27 @@ async def retrain(files: List[UploadFile] = File(...),
             layer.trainable = i >= freeze_until
         
         working_model.compile(
-            optimizer=tf.keras.optimizers.Adam(learning_rate=learning_rate),
+            optimizer=tf.keras.optimizers.legacy.Adam(learning_rate=learning_rate),  # Legacy optimizer for M1/M2 Macs
             loss='categorical_crossentropy',
             metrics=['accuracy']
         )
         
+        class ProgressCallback(tf.keras.callbacks.Callback):
+            def __init__(self, total_epochs):
+                super().__init__()
+                self.total_epochs = total_epochs
+
+            async def broadcast_progress(self, progress):
+                await ws_manager.broadcast(json.dumps({"progress": min(progress, 80)}))
+
+            def on_epoch_end(self, epoch, logs=None):
+                progress = 40 + ((epoch + 1) / self.total_epochs) * 40  # 40% to 80%
+                asyncio.create_task(self.broadcast_progress(progress))  # Schedule async task
+        
         callbacks = [
             tf.keras.callbacks.EarlyStopping(monitor='val_loss', patience=3, restore_best_weights=True),
-            tf.keras.callbacks.ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=2, min_lr=1e-7)
+            tf.keras.callbacks.ReduceLROnPlateau(monitor='val_loss', factor=0.5, patience=2, min_lr=1e-7),
+            ProgressCallback(epochs)
         ]
         
         history = working_model.fit(
@@ -481,25 +535,28 @@ async def retrain(files: List[UploadFile] = File(...),
             validation_steps=max(1, len(validation_generator))
         )
         
+        await ws_manager.broadcast(json.dumps({"progress": 80}))  # Training complete
+
         # 5. Evaluate on validation set
         validation_generator.reset()
         y_pred = working_model.predict(validation_generator)
         y_pred_classes = np.argmax(y_pred, axis=1)
         y_true = validation_generator.classes
         
-        # Filter to subset classes for reporting, handle undefined metrics
         class_report = classification_report(
             y_true,
             y_pred_classes,
             target_names=target_names,
             labels=class_indices,
             output_dict=True,
-            zero_division=0  # Suppress precision warnings
+            zero_division=0
         )
         
         # 6. Save visualizations
         viz_ids = save_visualizations_to_mongo(y_true, y_pred_classes, target_names, class_indices, history)
         
+        await ws_manager.broadcast(json.dumps({"progress": 90}))  # Visualizations saved
+
         # 7. Save the fine-tuned model
         fine_tuned_model_path = os.path.join(os.path.dirname(MODEL_PATH), "plant_disease_model.h5")
         working_model.save(fine_tuned_model_path)
@@ -508,7 +565,7 @@ async def retrain(files: List[UploadFile] = File(...),
         # 8. Prepare metrics and save to database
         class_metrics = {}
         for class_name in target_names:
-            if class_name in class_report:  # Check if class exists in report
+            if class_name in class_report:
                 class_metrics[class_name] = {
                     "precision": float(class_report[class_name].get('precision', 0.0)),
                     "recall": float(class_report[class_name].get('recall', 0.0)),
@@ -529,6 +586,8 @@ async def retrain(files: List[UploadFile] = File(...),
         db.add(retraining)
         db.commit()
         
+        await ws_manager.broadcast(json.dumps({"progress": 100}))  # Complete
+
         # 9. Prepare response
         base_url = os.getenv("BASE_URL", "")
         visualization_files = {
@@ -559,8 +618,8 @@ async def retrain(files: List[UploadFile] = File(...),
         raise he
     except Exception as e:
         import traceback
-        print(f"Error during retraining: {str(e)}")  # Log to console
-        print(traceback.format_exc())  # Full stack trace
+        print(f"Error during retraining: {str(e)}")
+        print(traceback.format_exc())
         return JSONResponse(content={
             "error": str(e),
             "details": traceback.format_exc()
