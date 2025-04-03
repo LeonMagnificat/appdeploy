@@ -45,6 +45,7 @@ MONGO_URI = os.getenv("MONGO_URI", "mongodb://localhost:27017")
 mongo_client = MongoClient(MONGO_URI)
 mongo_db = mongo_client["plant_disease_db"]
 visualizations_collection = mongo_db["visualizations"]
+zip_data_collection = mongo_db["zip_data"]
 
 # JWT Configuration
 SECRET_KEY = os.getenv("SECRET_KEY", "your-secret-key")
@@ -84,7 +85,7 @@ class Retraining(Base):
     num_classes = Column(Integer, nullable=False)
     training_accuracy = Column(Float)
     validation_accuracy = Column(Float, nullable=True)
-    class_metrics = Column(Text)  # Store JSON string
+    class_metrics = Column(Text)
     timestamp = Column(DateTime, default=datetime.utcnow)
     user = relationship("User", back_populates="retrainings")
 
@@ -93,15 +94,12 @@ Base.metadata.create_all(bind=engine)
 # Define base directory and paths
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 UPLOAD_DIR = os.path.join(BASE_DIR, "Data")
-MODEL_PATH = os.path.join(BASE_DIR, "../models/plant_disease_model.h5")  # Updated to .keras format
+MODEL_PATH = os.path.join(BASE_DIR, "../models/plant_disease_model.h5")
 
-# Create directories upfront
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
-# Initialize FastAPI app
 app = FastAPI()
 
-# Add CORS middleware
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -110,14 +108,12 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Load model
 print(f"Model path: {MODEL_PATH}")
 print(f"Does the model file exist? {os.path.exists(MODEL_PATH)}")
 if not os.path.exists(MODEL_PATH):
     raise FileNotFoundError(f"Model file not found at {MODEL_PATH}")
 model = tf.keras.models.load_model(MODEL_PATH)
 
-# Define initial class names for plant diseases
 CLASS_NAMES = [
     'Apple___Apple_scab', 'Apple___Black_rot', 'Apple___Cedar_apple_rust', 'Apple___healthy',
     'Blueberry___healthy', 'Cherry_(including_sour)___Powdery_mildew', 'Cherry_(including_sour)___healthy',
@@ -133,7 +129,7 @@ CLASS_NAMES = [
     'Tomato___Tomato_mosaic_virus', 'Tomato___healthy'
 ]
 
-# Pydantic models for request/response
+# Pydantic models
 class UserCreate(BaseModel):
     username: str
     password: str
@@ -142,7 +138,11 @@ class Token(BaseModel):
     access_token: str
     token_type: str
 
-# WebSocket manager
+class RetrainRequest(BaseModel):
+    zip_id: str
+    learning_rate: float = 0.0001
+    epochs: int = 10
+
 class WebSocketManager:
     def __init__(self):
         self.active_connections: List[WebSocket] = []
@@ -168,7 +168,6 @@ class WebSocketManager:
 
 ws_manager = WebSocketManager()
 
-# Utility functions
 def verify_password(plain_password, hashed_password):
     return pwd_context.verify(plain_password, hashed_password)
 
@@ -213,13 +212,11 @@ async def get_current_user(token: str = Depends(oauth2_scheme), db: Session = De
     return user
 
 def preprocess_image(img_path: str):
-    """Preprocess image for prediction."""
     img = image.load_img(img_path, target_size=(128, 128))
     img_array = image.img_to_array(img) / 255.0
     img_array = np.expand_dims(img_array, axis=0)
     return img_array
 
-# Authentication endpoints
 @app.post("/signup", response_model=Token)
 async def signup(user: UserCreate, db: Session = Depends(get_db)):
     db_user = get_user(db, username=user.username)
@@ -245,18 +242,16 @@ async def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = 
     access_token = create_access_token(data={"sub": user.username})
     return {"access_token": access_token, "token_type": "bearer"}
 
-# WebSocket endpoint
 @app.websocket("/ws/retrain-progress")
 async def websocket_endpoint(websocket: WebSocket):
     await ws_manager.connect(websocket)
     try:
         while True:
-            await websocket.receive_text()  # Keep connection alive
+            await websocket.receive_text()
     except Exception as e:
         print(f"WebSocket disconnected: {e}")
         ws_manager.disconnect(websocket)
 
-# Protected endpoints
 @app.post("/predict")
 async def predict(file: UploadFile = File(...),
                  db: Session = Depends(get_db),
@@ -280,16 +275,45 @@ async def predict(file: UploadFile = File(...),
     
     return JSONResponse(content={"prediction": disease, "confidence": float(confidence)})
 
+@app.post("/upload-zip-to-mongo")
+async def upload_zip_to_mongo(file: UploadFile = File(...),
+                              db: Session = Depends(get_db),
+                              current_user: User = Depends(get_current_user)):
+    if not file.filename.endswith(".zip"):
+        raise HTTPException(status_code=400, detail="File must be a ZIP file")
+    
+    zip_content = await file.read()
+    
+    with zipfile.ZipFile(io.BytesIO(zip_content), 'r') as zip_ref:
+        namelist = zip_ref.namelist()
+        has_train = any(name.startswith('train/') for name in namelist)
+        has_val = any(name.startswith('val/') for name in namelist)
+        if not (has_train and has_val):
+            raise HTTPException(status_code=400, detail="ZIP file must contain 'train' and 'val' folders")
+    
+    zip_doc = {
+        "user_id": current_user.id,
+        "filename": file.filename,
+        "data": zip_content,
+        "timestamp": datetime.utcnow()
+    }
+    result = zip_data_collection.insert_one(zip_doc)
+    
+    return JSONResponse(content={"message": "ZIP file uploaded successfully", "zip_id": str(result.inserted_id)})
+
+@app.get("/zip_data")
+async def check_zip_data(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    zip_doc = zip_data_collection.find_one({"user_id": current_user.id})
+    if zip_doc:
+        return JSONResponse(content={"zip_id": str(zip_doc["_id"])})
+    return JSONResponse(content={"zip_id": None})
+
 def extract_zip(zip_path, extract_to):
-    """Extract ZIP files."""
     with zipfile.ZipFile(zip_path, 'r') as zip_ref:
         zip_ref.extractall(extract_to)
 
 def save_visualizations_to_mongo(y_true, y_pred_classes, target_names, class_indices, history=None):
-    """Save visualizations to MongoDB and return their IDs."""
     viz_ids = {}
-
-    # 1. Classification Report
     class_report = classification_report(y_true, y_pred_classes, target_names=target_names, labels=class_indices, output_dict=True, zero_division=0)
     headers = ["Class", "Precision", "Recall", "F1-Score", "Support"]
     rows = []
@@ -330,7 +354,6 @@ def save_visualizations_to_mongo(y_true, y_pred_classes, target_names, class_ind
     plt.close()
     buf.close()
 
-    # 2. Confusion Matrix
     cm = confusion_matrix(y_true, y_pred_classes, labels=class_indices)
     plt.figure(figsize=(max(10, len(target_names)), max(10, len(target_names))))
     sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', xticklabels=target_names, yticklabels=target_names, cbar=True)
@@ -347,7 +370,6 @@ def save_visualizations_to_mongo(y_true, y_pred_classes, target_names, class_ind
     plt.close()
     buf.close()
 
-    # 3. Training and Validation Loss
     if history and 'loss' in history.history:
         plt.figure(figsize=(10, 6))
         plt.plot(history.history['loss'], label='Training Loss', color='blue', linewidth=2)
@@ -366,7 +388,6 @@ def save_visualizations_to_mongo(y_true, y_pred_classes, target_names, class_ind
         plt.close()
         buf.close()
 
-    # 4. Training and Validation Accuracy
     if history and 'accuracy' in history.history:
         plt.figure(figsize=(10, 6))
         plt.plot(history.history['accuracy'], label='Training Accuracy', color='blue', linewidth=2)
@@ -388,34 +409,34 @@ def save_visualizations_to_mongo(y_true, y_pred_classes, target_names, class_ind
     return viz_ids
 
 @app.post("/retrain")
-async def retrain(files: List[UploadFile] = File(...),
-                 learning_rate: float = 0.0001,
-                 epochs: int = 10,
-                 db: Session = Depends(get_db),
-                 current_user: User = Depends(get_current_user)):
+async def retrain(request: RetrainRequest,
+                  db: Session = Depends(get_db),
+                  current_user: User = Depends(get_current_user)):
     global model, CLASS_NAMES
+    
+    zip_id = request.zip_id
+    learning_rate = request.learning_rate
+    epochs = request.epochs
     
     new_data_dir = os.path.join(UPLOAD_DIR, "new_data")
     os.makedirs(new_data_dir, exist_ok=True)
     
     try:
-        # 1. Process uploaded files
-        extracted_dirs = []
-        for file in files:
-            file_path = os.path.join(UPLOAD_DIR, file.filename)
-            with open(file_path, "wb") as buffer:
-                shutil.copyfileobj(file.file, buffer)
-            
-            if file.filename.endswith(".zip"):
-                extract_dir = os.path.join(UPLOAD_DIR, f"extract_{os.path.splitext(file.filename)[0]}")
-                os.makedirs(extract_dir, exist_ok=True)
-                extract_zip(file_path, extract_dir)
-                extracted_dirs.append(extract_dir)
-                os.remove(file_path)
+        zip_doc = zip_data_collection.find_one({"_id": ObjectId(zip_id), "user_id": current_user.id})
+        if not zip_doc or "data" not in zip_doc:
+            raise HTTPException(status_code=404, detail="ZIP file not found or access denied")
         
-        await ws_manager.broadcast(json.dumps({"progress": 10}))  # Step 1 complete
+        zip_content = zip_doc["data"]
+        temp_zip_path = os.path.join(UPLOAD_DIR, f"temp_{zip_id}.zip")
+        with open(temp_zip_path, "wb") as f:
+            f.write(zip_content)
+        
+        extract_dir = os.path.join(UPLOAD_DIR, f"extract_{zip_id}")
+        os.makedirs(extract_dir, exist_ok=True)
+        extract_zip(temp_zip_path, extract_dir)
+        
+        await ws_manager.broadcast(json.dumps({"progress": 10}))
 
-        # 2. Organize data and classify images
         class_counts = {}
         initial_predictions = {"train": {}, "val": {}}
         
@@ -458,9 +479,8 @@ async def retrain(files: List[UploadFile] = File(...),
         target_names = list(class_counts.keys())
         class_indices = [CLASS_NAMES.index(cls) for cls in target_names]
         
-        await ws_manager.broadcast(json.dumps({"progress": 30}))  # Step 2 complete
+        await ws_manager.broadcast(json.dumps({"progress": 30}))
 
-        # 3. Create data generators
         train_dir = os.path.join(new_data_dir, "train")
         val_dir = os.path.join(new_data_dir, "val")
         
@@ -490,9 +510,8 @@ async def retrain(files: List[UploadFile] = File(...),
             shuffle=False
         )
         
-        await ws_manager.broadcast(json.dumps({"progress": 40}))  # Step 3 complete
+        await ws_manager.broadcast(json.dumps({"progress": 40}))
 
-        # 4. Fine-tune the model
         temp_model_path = os.path.join(os.path.dirname(MODEL_PATH), "temp_model.h5")
         model.save(temp_model_path)
         working_model = tf.keras.models.load_model(temp_model_path)
@@ -503,7 +522,7 @@ async def retrain(files: List[UploadFile] = File(...),
             layer.trainable = i >= freeze_until
         
         working_model.compile(
-            optimizer=tf.keras.optimizers.legacy.Adam(learning_rate=learning_rate),  # Legacy optimizer for M1/M2 Macs
+            optimizer=tf.keras.optimizers.legacy.Adam(learning_rate=learning_rate),
             loss='categorical_crossentropy',
             metrics=['accuracy']
         )
@@ -517,8 +536,8 @@ async def retrain(files: List[UploadFile] = File(...),
                 await ws_manager.broadcast(json.dumps({"progress": min(progress, 80)}))
 
             def on_epoch_end(self, epoch, logs=None):
-                progress = 40 + ((epoch + 1) / self.total_epochs) * 40  # 40% to 80%
-                asyncio.create_task(self.broadcast_progress(progress))  # Schedule async task
+                progress = 40 + ((epoch + 1) / self.total_epochs) * 40
+                asyncio.create_task(self.broadcast_progress(progress))
         
         callbacks = [
             tf.keras.callbacks.EarlyStopping(monitor='val_loss', patience=3, restore_best_weights=True),
@@ -535,9 +554,8 @@ async def retrain(files: List[UploadFile] = File(...),
             validation_steps=max(1, len(validation_generator))
         )
         
-        await ws_manager.broadcast(json.dumps({"progress": 80}))  # Training complete
+        await ws_manager.broadcast(json.dumps({"progress": 80}))
 
-        # 5. Evaluate on validation set
         validation_generator.reset()
         y_pred = working_model.predict(validation_generator)
         y_pred_classes = np.argmax(y_pred, axis=1)
@@ -552,17 +570,14 @@ async def retrain(files: List[UploadFile] = File(...),
             zero_division=0
         )
         
-        # 6. Save visualizations
         viz_ids = save_visualizations_to_mongo(y_true, y_pred_classes, target_names, class_indices, history)
         
-        await ws_manager.broadcast(json.dumps({"progress": 90}))  # Visualizations saved
+        await ws_manager.broadcast(json.dumps({"progress": 90}))
 
-        # 7. Save the fine-tuned model
         fine_tuned_model_path = os.path.join(os.path.dirname(MODEL_PATH), "plant_disease_model.h5")
         working_model.save(fine_tuned_model_path)
         model = tf.keras.models.load_model(fine_tuned_model_path)
         
-        # 8. Prepare metrics and save to database
         class_metrics = {}
         for class_name in target_names:
             if class_name in class_report:
@@ -586,9 +601,8 @@ async def retrain(files: List[UploadFile] = File(...),
         db.add(retraining)
         db.commit()
         
-        await ws_manager.broadcast(json.dumps({"progress": 100}))  # Complete
+        await ws_manager.broadcast(json.dumps({"progress": 100}))
 
-        # 9. Prepare response
         base_url = os.getenv("BASE_URL", "")
         visualization_files = {
             "classification_report": f"{base_url}/visualization/{viz_ids.get('classification_report')}",
@@ -626,12 +640,13 @@ async def retrain(files: List[UploadFile] = File(...),
         }, status_code=500)
     
     finally:
-        for extract_dir in extracted_dirs:
-            if os.path.exists(extract_dir):
-                shutil.rmtree(extract_dir)
+        if 'extract_dir' in locals() and os.path.exists(extract_dir):
+            shutil.rmtree(extract_dir)
         if os.path.exists(new_data_dir):
             shutil.rmtree(new_data_dir)
-        if os.path.exists(temp_model_path):
+        if 'temp_zip_path' in locals() and os.path.exists(temp_zip_path):
+            os.remove(temp_zip_path)
+        if 'temp_model_path' in locals() and os.path.exists(temp_model_path):
             os.remove(temp_model_path)
 
 @app.get("/visualization/{viz_id}")
